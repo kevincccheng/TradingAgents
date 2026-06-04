@@ -1,7 +1,8 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
 echo ============================================
-echo  TradingAgents — Windows Setup
+echo  TradingAgents - Windows Setup
 echo ============================================
 echo.
 
@@ -29,7 +30,7 @@ python -m pip install --upgrade pip --quiet
 echo Installing TradingAgents and dependencies...
 pip install -e . --quiet
 if errorlevel 1 (
-    echo ERROR: pip install failed. Check requirements above.
+    echo ERROR: pip install failed. Check output above.
     pause
     exit /b 1
 )
