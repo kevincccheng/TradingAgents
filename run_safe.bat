@@ -15,7 +15,7 @@ if not exist "outputs" mkdir outputs
 if not exist "outputs\crash_logs" mkdir outputs\crash_logs
 set TRADINGAGENTS_RESULTS_DIR=outputs
 
-rem ---- API key check (reads .env directly) ----------------------
+rem ---- API key check (runs once at startup) ---------------------
 set KEY_OK=0
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
@@ -30,7 +30,9 @@ if %KEY_OK%==0 (
     echo.
 )
 
-rem ---- Crash log with timestamp ---------------------------------
+rem ================================================================
+:run_loop
+rem ---- Crash log with fresh timestamp each run ------------------
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"') do set TIMESTAMP=%%i
 set CRASH_LOG=outputs\crash_logs\crash_%TIMESTAMP%.txt
 
@@ -73,6 +75,15 @@ if %EXIT_CODE% neq 0 (
         for /f "delims=" %%F in ('powershell -NoProfile -Command "Get-ChildItem reports\latest\*.pdf -EA 0 ^| Sort LastWriteTime -Desc ^| Select -First 1 -Expand FullName"') do start msedge "%%F"
     )
 )
+
+rem ---- Run again? -----------------------------------------------
 echo.
-pause
+echo ============================================
+set /p CHOICE=  Run another analysis? [Y/N]:  
+if /i "%CHOICE%"=="Y" goto run_loop
+if /i "%CHOICE%"=="y" goto run_loop
+
+echo.
+echo  Session closed. Your PDFs are in reports\latest
+echo ============================================
 popd
