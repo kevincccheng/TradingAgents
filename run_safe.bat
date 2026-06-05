@@ -43,9 +43,10 @@ set EXIT_CODE=%ERRORLEVEL%
 echo.
 
 rem ---- Post-run handling ----------------------------------------
+rem NOTE: no parentheses in echo lines inside if-blocks -- batch misparses them
 if %EXIT_CODE% neq 0 (
     echo ============================================
-    echo  Analysis ended with error (exit code %EXIT_CODE%)
+    echo  Analysis ended with error - exit code: %EXIT_CODE%
     echo  Crash log: %CRASH_LOG%
     echo  Attempting to save any partial output...
     echo ============================================

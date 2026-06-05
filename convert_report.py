@@ -835,8 +835,24 @@ if __name__ == '__main__':
         print(f'Latest  : {latest}')
         sys.exit(0)
 
-    # Auto-find: prefer complete report, fall back to partial sections
+    # Auto-find: use whichever is MORE RECENT — complete report or partial sections.
+    # This prevents an old complete_report.md (e.g. MU) from shadowing fresh
+    # partial sections from a newer crashed run (e.g. GOOGL).
     rp = find_complete_report(base)
+    ticker, date, sections = find_partial_sections(base)
+
+    # If both exist, keep whichever was written most recently
+    if rp and sections:
+        partial_files = (
+            glob.glob(str(base / 'outputs' / '**' / '*.md'), recursive=True) +
+            glob.glob(str(base / 'reports' / '**' / '*.md'), recursive=True)
+        )
+        partial_files = [f for f in partial_files if 'complete_report' not in f]
+        if partial_files:
+            latest_partial_mtime = max(os.path.getmtime(f) for f in partial_files)
+            if latest_partial_mtime > os.path.getmtime(rp):
+                rp = None   # partial sections are newer — use them instead
+
     if rp is not None:
         print(f'Source  : {rp}')
         primary, latest = build_pdf(rp)
@@ -844,8 +860,6 @@ if __name__ == '__main__':
         print(f'Latest  : {latest}')
         sys.exit(0)
 
-    # Try partial
-    ticker, date, sections = find_partial_sections(base)
     if sections:
         print(f'No complete_report.md found — building partial PDF from '
               f'{len(sections)} section(s)...')
