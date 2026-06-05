@@ -11,10 +11,6 @@ if not exist ".venv\Scripts\activate.bat" (
 
 call .venv\Scripts\activate.bat
 
-if exist ".env" (
-    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
-        if not "%%A"=="" if not "%%A:~0,1%"=="#" set "%%A=%%B"
-    )
-)
-
-tradingagents analyze
+rem .env is loaded automatically by tradingagents on startup (python-dotenv)
+tradingagents
+pause
