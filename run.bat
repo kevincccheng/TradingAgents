@@ -13,4 +13,3 @@ call .venv\Scripts\activate.bat
 
 rem .env is loaded automatically by tradingagents on startup (python-dotenv)
 tradingagents
-pause
