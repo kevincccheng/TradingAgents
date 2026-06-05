@@ -238,11 +238,17 @@ def build_pdf(report_path: Path) -> Path:
     date = m.group(1) if m else datetime.now().strftime('%Y-%m-%d')
 
     safe_ticker = re.sub(r'[\\/:*?"<>|]', '_', ticker)
-    pdf_path = report_path.parent / f'{safe_ticker}_{date}.pdf'
+    time_str = datetime.now().strftime('%H-%M-%S')
+    filename = f'{safe_ticker}_{date}_{time_str}.pdf'
 
     script_dir = Path(__file__).parent
-    latest = script_dir / 'outputs' / 'latest_report.pdf'
-    latest.parent.mkdir(exist_ok=True)
+    # Primary: reports/TICKER/DATE/  — unique filename, never conflicts with open viewers
+    primary_dir = script_dir / 'reports' / safe_ticker / date
+    primary_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = primary_dir / filename
+    # Latest folder: always has the most recent run, unique name so never locked
+    latest_dir = script_dir / 'reports' / 'latest'
+    latest_dir.mkdir(parents=True, exist_ok=True)
 
     NAVY  = colors.HexColor('#1B2B4B')
     GOLD  = colors.HexColor('#C09B3A')
@@ -525,13 +531,11 @@ def build_pdf(report_path: Path) -> Path:
               onFirstPage=lambda c, d: None,
               onLaterPages=draw_footer)
 
-    # Fix 1: wrap copy in try/except — PDF viewer may have file open
-    try:
-        shutil.copy2(pdf_path, latest)
-    except OSError:
-        pass
+    # Unique filename → no viewer can have this exact file open yet
+    latest_path = latest_dir / filename
+    shutil.copy2(pdf_path, latest_path)
 
-    return pdf_path
+    return pdf_path, latest_path
 
 
 # ── Partial-report PDF builder ────────────────────────────────────────────────
@@ -548,10 +552,15 @@ def build_partial_pdf(sections: list, ticker: str, date: str, base: Path) -> Pat
      PageBreak, HRFlowable) = _rl_imports()
 
     safe_ticker = re.sub(r'[\\/:*?"<>|]', '_', ticker)
-    out_dir = base / 'outputs'
-    out_dir.mkdir(exist_ok=True)
-    pdf_path = out_dir / f'partial_{safe_ticker}_{date}.pdf'
-    latest   = out_dir / 'latest_report.pdf'
+    time_str = datetime.now().strftime('%H-%M-%S')
+    filename = f'partial_{safe_ticker}_{date}_{time_str}.pdf'
+
+    script_dir = Path(__file__).parent
+    primary_dir = script_dir / 'reports' / safe_ticker / date
+    primary_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = primary_dir / filename
+    latest_dir = script_dir / 'reports' / 'latest'
+    latest_dir.mkdir(parents=True, exist_ok=True)
 
     AMBER  = colors.HexColor('#C09B3A')
     ORANGE = colors.HexColor('#8B4000')
@@ -804,13 +813,10 @@ def build_partial_pdf(sections: list, ticker: str, date: str, base: Path) -> Pat
               onFirstPage=lambda c, d: None,
               onLaterPages=draw_footer)
 
-    # Fix 1: wrap copy in try/except
-    try:
-        shutil.copy2(pdf_path, latest)
-    except OSError:
-        pass
+    latest_path = latest_dir / filename
+    shutil.copy2(pdf_path, latest_path)
 
-    return pdf_path
+    return pdf_path, latest_path
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -823,19 +829,19 @@ if __name__ == '__main__':
         rp = Path(sys.argv[1])
         if not rp.exists():
             sys.exit(f'ERROR: {rp} not found')
-        print(f'Source : {rp}')
-        pdf = build_pdf(rp)
-        print(f'PDF    : {pdf}')
-        print(f'Latest : {base / "outputs" / "latest_report.pdf"}')
+        print(f'Source  : {rp}')
+        primary, latest = build_pdf(rp)
+        print(f'PDF     : {primary}')
+        print(f'Latest  : {latest}')
         sys.exit(0)
 
     # Auto-find: prefer complete report, fall back to partial sections
     rp = find_complete_report(base)
     if rp is not None:
-        print(f'Source : {rp}')
-        pdf = build_pdf(rp)
-        print(f'PDF    : {pdf}')
-        print(f'Latest : {base / "outputs" / "latest_report.pdf"}')
+        print(f'Source  : {rp}')
+        primary, latest = build_pdf(rp)
+        print(f'PDF     : {primary}')
+        print(f'Latest  : {latest}')
         sys.exit(0)
 
     # Try partial
@@ -843,9 +849,9 @@ if __name__ == '__main__':
     if sections:
         print(f'No complete_report.md found — building partial PDF from '
               f'{len(sections)} section(s)...')
-        pdf = build_partial_pdf(sections, ticker, date, base)
-        print(f'PDF    : {pdf}')
-        print(f'Latest : {base / "outputs" / "latest_report.pdf"}')
+        primary, latest = build_partial_pdf(sections, ticker, date, base)
+        print(f'PDF     : {primary}')
+        print(f'Latest  : {latest}')
         sys.exit(0)
 
     sys.exit(

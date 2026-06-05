@@ -1,5 +1,5 @@
 @echo off
-chcp 65001 >nul
+chcp 65001 >/dev/null
 pushd "%~dp0"
 set PYTHONIOENCODING=utf-8
 
@@ -31,7 +31,7 @@ if %KEY_OK%==0 (
 )
 
 rem ---- Crash log with timestamp ---------------------------------
-for /f %%i in (\'powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"\') do set TIMESTAMP=%%i
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"') do set TIMESTAMP=%%i
 set CRASH_LOG=outputs\crash_logs\crash_%TIMESTAMP%.txt
 
 rem ---- Launch (stderr captured to crash log) --------------------
@@ -54,10 +54,11 @@ if %EXIT_CODE% neq 0 (
         echo  Check %CRASH_LOG% for error details.
     ) else (
         echo.
-        echo  Partial PDF: outputs\latest_report.pdf
+        echo  PDF saved to reports\latest
+        for /f "delims=" %%F in ('powershell -NoProfile -Command "Get-ChildItem reports\latest\*.pdf -EA 0 ^| Sort LastWriteTime -Desc ^| Select -First 1 -Expand FullName"') do start msedge "%%F"
     )
 ) else (
-    for %%F in ("%CRASH_LOG%") do if %%~zF==0 del "%CRASH_LOG%" 2>nul
+    for %%F in ("%CRASH_LOG%") do if %%~zF==0 del "%CRASH_LOG%" 2>/dev/null
     echo ============================================
     echo  Generating PDF report...
     echo  Tip: press Y at the Save report? prompt
@@ -68,7 +69,8 @@ if %EXIT_CODE% neq 0 (
         echo  NOTE: No saved report found. Press Y next time.
     ) else (
         echo.
-        echo  PDF saved to: outputs\latest_report.pdf
+        echo  PDF saved to reports\latest
+        for /f "delims=" %%F in ('powershell -NoProfile -Command "Get-ChildItem reports\latest\*.pdf -EA 0 ^| Sort LastWriteTime -Desc ^| Select -First 1 -Expand FullName"') do start msedge "%%F"
     )
 )
 echo.
