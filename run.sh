@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+cd "$(dirname "$0")"
 
 if [ ! -f ".venv/bin/activate" ]; then
     echo "ERROR: .venv not found. Run ./setup.sh first."
@@ -15,4 +15,15 @@ if [ -f ".env" ]; then
     set +a
 fi
 
-tradingagents analyze
+# Auto-save section reports + message log to outputs/TICKER/DATE/
+mkdir -p outputs
+export TRADINGAGENTS_RESULTS_DIR=outputs
+
+# 'script' tees all terminal output (including Rich TUI) to a timestamped log
+LOGFILE="outputs/session_$(date +%Y-%m-%d_%H-%M).txt"
+script -q "$LOGFILE" tradingagents
+
+echo ""
+echo "Session log saved to: $LOGFILE"
+echo "Section reports saved to: outputs/"
+read -rp "Press Enter to close..."

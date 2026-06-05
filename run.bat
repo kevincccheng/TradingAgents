@@ -11,5 +11,13 @@ if not exist ".venv\Scripts\activate.bat" (
 
 call .venv\Scripts\activate.bat
 
+rem Create outputs folder and point the auto-save there
+if not exist "outputs" mkdir outputs
+set TRADINGAGENTS_RESULTS_DIR=outputs
+
 rem .env is loaded automatically by tradingagents on startup (python-dotenv)
 tradingagents
+
+echo.
+echo Analysis complete. Section reports auto-saved to outputs\
+pause
