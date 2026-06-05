@@ -1,5 +1,5 @@
 @echo off
-chcp 65001 >/dev/null
+chcp 65001 >nul
 pushd "%~dp0"
 set PYTHONIOENCODING=utf-8
 
@@ -61,7 +61,7 @@ if %EXIT_CODE% neq 0 (
         powershell -NoProfile -WindowStyle Hidden -Command "$f = Get-ChildItem 'reports\latest\*.pdf' -EA 0 | Sort-Object LastWriteTime -Desc | Select-Object -First 1 -ExpandProperty FullName; if ($f) { Start-Process msedge $f }"
     )
 ) else (
-    for %%F in ("%CRASH_LOG%") do if %%~zF==0 del "%CRASH_LOG%" 2>/dev/null
+    for %%F in ("%CRASH_LOG%") do if %%~zF==0 del "%CRASH_LOG%" 2>nul
     echo ============================================
     echo  Generating PDF report...
     echo  Tip: press Y at the Save report? prompt
