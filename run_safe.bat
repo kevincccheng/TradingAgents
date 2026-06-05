@@ -57,7 +57,7 @@ if %EXIT_CODE% neq 0 (
     ) else (
         echo.
         echo  PDF saved to reports\latest
-        for /f "delims=" %%F in ('powershell -NoProfile -Command "Get-ChildItem reports\latest\*.pdf -EA 0 ^| Sort LastWriteTime -Desc ^| Select -First 1 -Expand FullName"') do start msedge "%%F"
+        powershell -NoProfile -WindowStyle Hidden -Command "$f = Get-ChildItem 'reports\latest\*.pdf' -EA 0 | Sort-Object LastWriteTime -Desc | Select-Object -First 1 -ExpandProperty FullName; if ($f) { Start-Process msedge $f }"
     )
 ) else (
     for %%F in ("%CRASH_LOG%") do if %%~zF==0 del "%CRASH_LOG%" 2>/dev/null
@@ -72,7 +72,7 @@ if %EXIT_CODE% neq 0 (
     ) else (
         echo.
         echo  PDF saved to reports\latest
-        for /f "delims=" %%F in ('powershell -NoProfile -Command "Get-ChildItem reports\latest\*.pdf -EA 0 ^| Sort LastWriteTime -Desc ^| Select -First 1 -Expand FullName"') do start msedge "%%F"
+        powershell -NoProfile -WindowStyle Hidden -Command "$f = Get-ChildItem 'reports\latest\*.pdf' -EA 0 | Sort-Object LastWriteTime -Desc | Select-Object -First 1 -ExpandProperty FullName; if ($f) { Start-Process msedge $f }"
     )
 )
 
