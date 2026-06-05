@@ -35,6 +35,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Installing PDF generator (reportlab)...
+pip install reportlab --quiet
+
 echo.
 echo ============================================
 echo  Setup complete!

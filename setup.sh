@@ -2,7 +2,7 @@
 set -e
 
 echo "============================================"
-echo " TradingAgents — Mac/Linux Setup"
+echo " TradingAgents - Mac/Linux Setup"
 echo "============================================"
 echo
 
@@ -22,6 +22,9 @@ pip install --upgrade pip --quiet
 
 echo "Installing TradingAgents and dependencies..."
 pip install -e . --quiet
+
+echo "Installing PDF generator (reportlab)..."
+pip install reportlab --quiet
 
 echo
 echo "============================================"

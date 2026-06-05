@@ -11,7 +11,6 @@ if not exist ".venv\Scripts\activate.bat" (
 
 call .venv\Scripts\activate.bat
 
-rem Create outputs folder and point the auto-save there
 if not exist "outputs" mkdir outputs
 set TRADINGAGENTS_RESULTS_DIR=outputs
 
@@ -19,5 +18,17 @@ rem .env is loaded automatically by tradingagents on startup (python-dotenv)
 tradingagents
 
 echo.
-echo Analysis complete. Section reports auto-saved to outputs\
+echo ============================================
+echo  Generating PDF report...
+echo  (Tip: press Y at Save report? for best results)
+echo ============================================
+python convert_report.py
+if errorlevel 1 (
+    echo NOTE: PDF skipped - no saved report found.
+    echo       Press Y at the Save report? prompt next time.
+) else (
+    echo.
+    echo PDF also saved to: outputs\latest_report.pdf
+)
+echo.
 pause

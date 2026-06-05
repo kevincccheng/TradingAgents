@@ -15,15 +15,22 @@ if [ -f ".env" ]; then
     set +a
 fi
 
-# Auto-save section reports + message log to outputs/TICKER/DATE/
 mkdir -p outputs
 export TRADINGAGENTS_RESULTS_DIR=outputs
 
-# 'script' tees all terminal output (including Rich TUI) to a timestamped log
+# Tee all terminal output (including Rich TUI) to a timestamped log
 LOGFILE="outputs/session_$(date +%Y-%m-%d_%H-%M).txt"
 script -q "$LOGFILE" tradingagents
 
 echo ""
-echo "Session log saved to: $LOGFILE"
-echo "Section reports saved to: outputs/"
+echo "============================================"
+echo " Generating PDF report..."
+echo " (Tip: press Y at Save report? for best results)"
+echo "============================================"
+python convert_report.py || echo "NOTE: PDF skipped — no saved report found."
+
+echo ""
+echo "Session log : $LOGFILE"
+echo "Latest PDF  : outputs/latest_report.pdf"
+echo ""
 read -rp "Press Enter to close..."
