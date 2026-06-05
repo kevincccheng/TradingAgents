@@ -3,13 +3,13 @@ chcp 65001 >nul
 pushd "%~dp0"
 set PYTHONIOENCODING=utf-8
 
-if not exist ".venv\Scriptsctivate.bat" (
+if not exist ".venv\Scripts\activate.bat" (
     echo ERROR: .venv not found. Run setup.bat first.
     pause
     popd & exit /b 1
 )
 
-call .venv\Scriptsctivate.bat
+call .venv\Scripts\activate.bat
 
 if not exist "outputs" mkdir outputs
 if not exist "outputs\crash_logs" mkdir outputs\crash_logs
@@ -31,7 +31,7 @@ if %KEY_OK%==0 (
 )
 
 rem ---- Crash log with timestamp ---------------------------------
-for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"') do set TIMESTAMP=%%i
+for /f %%i in (\'powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"\') do set TIMESTAMP=%%i
 set CRASH_LOG=outputs\crash_logs\crash_%TIMESTAMP%.txt
 
 rem ---- Launch (stderr captured to crash log) --------------------
