@@ -1,0 +1,19 @@
+# Line-ending policy for TradingAgents
+# Overrides core.autocrlf so every clone gets the right endings
+# regardless of the host OS or git client settings.
+
+# Default: normalise text files to LF in the repo, LF in working tree
+* text=auto eol=lf
+
+# Windows batch files MUST have CRLF — cmd.exe won't parse LF-only .bat files
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts must stay LF (they break with CRLF on Linux/macOS)
+*.sh  text eol=lf
+
+# Binary files — never touch line endings
+*.pdf binary
+*.png binary
+*.jpg binary
+*.ico binary
