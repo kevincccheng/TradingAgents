@@ -2,7 +2,7 @@
 # ── Kevin's enhanced launcher ──────────────────────────────────────────────
 # Sets USE_DATA_ENHANCER=1 so the HK/China fundamentals fallback chain
 # (AKShare → LSEG) activates automatically for .HK / .SS / .SZ tickers.
-# LSEG only fires when LSEG_APP_KEY is present in .env and both yFinance
+# LSEG only fires when EDP_API_KEY is present in .env and both yFinance
 # and AKShare return incomplete data. Run is otherwise identical to the
 # original run_safe.sh — that file is left untouched.
 # ──────────────────────────────────────────────────────────────────────────

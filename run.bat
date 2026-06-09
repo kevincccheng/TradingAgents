@@ -2,7 +2,7 @@
 rem ── Kevin's enhanced launcher ─────────────────────────────────────────────
 rem   Sets USE_DATA_ENHANCER=1 so the HK/China fundamentals fallback chain
 rem   (AKShare → LSEG) activates automatically for .HK / .SS / .SZ tickers.
-rem   LSEG only fires when LSEG_APP_KEY is present in .env and both yFinance
+rem   LSEG only fires when EDP_API_KEY is present in .env and both yFinance
 rem   and AKShare return incomplete data.  Run is otherwise identical to the
 rem   original run_safe.bat — that file is left untouched.
 rem ─────────────────────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ if not exist ".venv\Scripts\activate.bat" (
 
 call .venv\Scripts\activate.bat
 
-rem ── Load .env so LSEG_APP_KEY and other keys are available ───────────────
+rem ── Load .env so EDP_API_KEY and other keys are available ───────────────
 if exist ".env" (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
         if not "%%A"=="" if not "%%A:~0,1%"=="#" (

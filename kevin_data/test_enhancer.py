@@ -123,12 +123,12 @@ class TestEnhancedFundamentals(unittest.TestCase):
         self.assertIn("PE Ratio: 8.5", result)
 
     def test_lseg_not_triggered_without_app_key(self):
-        """LSEG must NOT fire when LSEG_APP_KEY is absent."""
+        """LSEG must NOT fire when EDP_API_KEY is absent."""
         original = self._make_original("Name: XYZ\nBeta: 1.1")
         enhanced = de._make_enhanced_fundamentals(original)
 
         with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("LSEG_APP_KEY", None)
+            os.environ.pop("EDP_API_KEY", None)
             with patch.object(de, "_fetch_akshare", return_value=None), \
                  patch.object(de, "_fetch_lseg") as mock_lseg:
                 enhanced("0700.HK", "2026-06-09")
@@ -150,7 +150,7 @@ class TestEnhancedFundamentals(unittest.TestCase):
 
         enhanced = de._make_enhanced_fundamentals(original)
 
-        with patch.dict(os.environ, {"LSEG_APP_KEY": "fake-key"}):
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake-key"}):
             with patch.object(de, "_fetch_akshare", return_value=None), \
                  patch.object(de, "_fetch_lseg", side_effect=fake_lseg):
                 for i in range(15):
@@ -173,7 +173,7 @@ class TestEnhancedFundamentals(unittest.TestCase):
     def test_lseg_hard_cap_blocks_at_10(self):
         """_fetch_lseg must return None when _lseg_calls >= _LSEG_MAX_CALLS."""
         de._lseg_calls = 10
-        with patch.dict(os.environ, {"LSEG_APP_KEY": "fake-key"}):
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake-key"}):
             result = de._fetch_lseg("0700.HK", "test")
         self.assertIsNone(result)
         de._lseg_calls = 0  # reset for other tests

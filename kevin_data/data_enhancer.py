@@ -7,7 +7,7 @@ so the routing layer transparently gains the fallback without knowing about it.
 Fallback order (fundamentals only):
   1. yFinance  — always tried first
   2. AKShare   — if yFinance is empty/incomplete for .HK / .SS / .SZ
-  3. LSEG      — last resort; only if LSEG_APP_KEY set + both above incomplete
+  3. LSEG      — last resort; only if EDP_API_KEY set + both above incomplete
                  Hard cap: 10 LSEG calls per run. Rate limit: 2 s between calls.
 
 News/prices are untouched — this file never replaces those data flows.
@@ -318,7 +318,7 @@ def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
     """
     global _lseg_calls
 
-    app_key = os.environ.get("LSEG_APP_KEY", "").strip()
+    app_key = os.environ.get("EDP_API_KEY", "").strip()
     if not app_key:
         return None
     if not _is_asia(ticker):
@@ -442,7 +442,7 @@ def _make_enhanced_fundamentals(original_fn):
         # ── Step 3: LSEG last resort ──────────────────────────────────────
         lseg_text: Optional[str] = None
         lseg_triggered = False
-        app_key = os.environ.get("LSEG_APP_KEY", "").strip()
+        app_key = os.environ.get("EDP_API_KEY", "").strip()
 
         if app_key and _needs_lseg(combined) and _lseg_calls < _LSEG_MAX_CALLS:
             trigger = (
@@ -519,7 +519,7 @@ def apply_patches() -> None:
         logging.info(
             "DataEnhancer: HK/China fundamentals fallback active "
             "(AKShare%s)",
-            " + LSEG" if os.environ.get("LSEG_APP_KEY") else "",
+            " + LSEG" if os.environ.get("EDP_API_KEY") else "",
         )
     except Exception as exc:
         logging.warning("DataEnhancer: patch failed — %s", exc)
