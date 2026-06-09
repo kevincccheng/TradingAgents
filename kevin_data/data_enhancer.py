@@ -1,16 +1,23 @@
 """
-HK/China fundamentals enhancer — AKShare + LSEG fallback chain.
+TradingAgents data enhancer — HK/China fundamentals + Finnhub news.
 
 Activated by monkey-patching tradingagents.dataflows.interface.VENDOR_METHODS
-so the routing layer transparently gains the fallback without knowing about it.
+so the routing layer transparently gains the fallbacks without knowing about them.
 
-Fallback order (fundamentals only):
+FUNDAMENTALS fallback order (.HK / .SS / .SZ only):
   1. yFinance  — always tried first
-  2. AKShare   — if yFinance is empty/incomplete for .HK / .SS / .SZ
+  2. AKShare   — if yFinance is empty/incomplete
   3. LSEG      — last resort; only if EDP_API_KEY set + both above incomplete
-                 Hard cap: 10 LSEG calls per run. Rate limit: 2 s between calls.
+                 Hard cap: 10 LSEG calls/run. Rate limit: 2 s between calls.
 
-News/prices are untouched — this file never replaces those data flows.
+NEWS fallback order:
+  Asia tickers (.HK / .SS / .SZ):
+    Finnhub PRIMARY → yFinance fallback   (when FINNHUB_API_KEY set)
+  US tickers:
+    yFinance PRIMARY → Finnhub fallback   (when FINNHUB_API_KEY set)
+  Hard cap: 20 Finnhub calls/run.
+
+Usage log appended to lseg_usage.log (project root) for every LSEG/Finnhub call.
 """
 
 from __future__ import annotations
@@ -19,55 +26,47 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-# ── paths ────────────────────────────────────────────────────────────────────
+# ── paths ─────────────────────────────────────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).parent.parent
-_LSEG_LOG = _PROJECT_ROOT / "lseg_usage.log"
+_USAGE_LOG = _PROJECT_ROOT / "lseg_usage.log"   # shared log for LSEG + Finnhub
 
 # ── tunable constants ─────────────────────────────────────────────────────────
-_LSEG_MAX_CALLS = 10
-_LSEG_RATE_SLEEP = 2       # seconds between LSEG calls
-_LSEG_TIMEOUT = 30         # seconds before giving up on a LSEG call
-_AK_TIMEOUT = 15           # seconds before giving up on an AKShare call
+_LSEG_MAX_CALLS    = 10
+_LSEG_RATE_SLEEP   = 2       # seconds between LSEG calls
+_LSEG_TIMEOUT      = 30      # seconds before giving up on a LSEG call
+_AK_TIMEOUT        = 15      # seconds before giving up on an AKShare call
+_FINNHUB_MAX_CALLS = 20
+_FINNHUB_TIMEOUT   = 15      # seconds before giving up on a Finnhub call
+_FINNHUB_DAYS_BACK = 30      # news lookback window
 
-# Fields checked for completeness — keys in yFinance text labels
+# Fields checked for fundamentals completeness
 _KEY_FIELD_CHECKS = [
-    ("PE",           ["pe ratio", "pe:", "p/e", "trailingpe"]),
-    ("EPS",          ["eps", "earnings per share", "trailingeps"]),
-    ("Revenue",      ["revenue"]),
-    ("Net Income",   ["net income"]),
-    ("Debt/Equity",  ["debt to equity", "debt/equity"]),
+    ("PE",          ["pe ratio", "pe:", "p/e", "trailingpe"]),
+    ("EPS",         ["eps", "earnings per share", "trailingeps"]),
+    ("Revenue",     ["revenue"]),
+    ("Net Income",  ["net income"]),
+    ("Debt/Equity", ["debt to equity", "debt/equity"]),
 ]
 
 # LSEG RIC fields and friendly labels
 _LSEG_FIELDS = [
-    "TR.PERatio",
-    "TR.EPSActValue",
-    "TR.Revenue",
-    "TR.NetIncome",
-    "TR.TotalDebt",
-    "TR.BookValuePerShare",
-    "TR.DividendYield",
-    "TR.ROE",
-    "TR.ROA",
+    "TR.PERatio", "TR.EPSActValue", "TR.Revenue", "TR.NetIncome",
+    "TR.TotalDebt", "TR.BookValuePerShare", "TR.DividendYield",
+    "TR.ROE", "TR.ROA",
 ]
 _LSEG_LABELS = [
-    "PE Ratio",
-    "EPS",
-    "Revenue",
-    "Net Income",
-    "Total Debt",
-    "Book Value per Share",
-    "Dividend Yield",
-    "Return on Equity",
-    "Return on Assets",
+    "PE Ratio", "EPS", "Revenue", "Net Income",
+    "Total Debt", "Book Value per Share", "Dividend Yield",
+    "Return on Equity", "Return on Assets",
 ]
 
 # ── per-run mutable state ─────────────────────────────────────────────────────
-_lseg_calls: int = 0
+_lseg_calls:    int = 0
+_finnhub_calls: int = 0
 
 
 # ── ticker helpers ────────────────────────────────────────────────────────────
@@ -93,9 +92,9 @@ def _akshare_parts(ticker: str) -> tuple[str, str]:
     return ticker, "unknown"
 
 
-# ── completeness check ────────────────────────────────────────────────────────
+# ── fundamentals completeness ─────────────────────────────────────────────────
 def _missing_key_fields(text: str) -> int:
-    """Count how many of the 5 key fields are absent in *text*."""
+    """Count how many of the 5 key fundamentals fields are absent in *text*."""
     low = (text or "").lower()
     return sum(
         1 for _, keywords in _KEY_FIELD_CHECKS
@@ -104,7 +103,7 @@ def _missing_key_fields(text: str) -> int:
 
 
 def _yf_is_usable(text: str) -> bool:
-    """yFinance result is 'good enough' to skip AKShare."""
+    """Return True if yFinance fundamentals result is complete enough to skip AKShare."""
     if not text:
         return False
     if any(s in text for s in ("Error retrieving", "NO_DATA_AVAILABLE")):
@@ -117,41 +116,39 @@ def _needs_lseg(combined: str) -> bool:
     return _missing_key_fields(combined) > 3
 
 
-# ── LSEG usage log ────────────────────────────────────────────────────────────
-def _log_lseg_call(ticker: str, fields_fetched: list[str], trigger: str) -> None:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    line = (
-        f"{ts} | {ticker} | {','.join(fields_fetched)} | "
-        f"{_lseg_calls} calls | {trigger}\n"
-    )
+# ── usage log helpers ─────────────────────────────────────────────────────────
+def _append_log(line: str) -> None:
     try:
-        _LSEG_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _LSEG_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        _USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _USAGE_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
     except Exception:
         pass
 
 
-def _log_run_summary(
-    ticker: str,
-    yf_ok: bool,
-    ak_ok: bool,
-    lseg_triggered: bool,
-) -> None:
+def _log_lseg_call(ticker: str, fields_fetched: list[str], trigger: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    line = (
+    _append_log(
+        f"{ts} | {ticker} | {','.join(fields_fetched)} | "
+        f"{_lseg_calls} calls | {trigger}"
+    )
+
+
+def _log_run_summary(ticker: str, yf_ok: bool, ak_ok: bool, lseg_triggered: bool) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    _append_log(
         f"RUN COMPLETE | {ticker} | "
         f"yfinance:{'ok' if yf_ok else 'fail'} | "
         f"akshare:{'ok' if ak_ok else 'fail'} | "
         f"lseg:{'triggered' if lseg_triggered else 'skipped'} | "
-        f"total_lseg_calls_today:{_lseg_calls}\n"
+        f"total_lseg_calls_today:{_lseg_calls}"
     )
-    try:
-        _LSEG_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _LSEG_LOG.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-    except Exception:
-        pass
+
+
+def _log_finnhub_call(ticker: str, articles_found: int, calls_made: int) -> None:
+    _append_log(
+        f"FINNHUB | {ticker} | articles_found:{articles_found} | calls_made:{calls_made}"
+    )
 
 
 # ── AKShare fetcher ───────────────────────────────────────────────────────────
@@ -164,50 +161,42 @@ def _safe_val(obj, key: str) -> str:
             return ""
         s = str(v).strip()
         return "" if s in ("--", "nan", "None", "") else s
-    except (KeyError, TypeError, Exception):
+    except Exception:
         return ""
 
 
 def _do_akshare_hk(code: str, ticker: str) -> list[str]:
-    """Fetch HK stock fundamentals from AKShare. Returns list of 'Label: value' lines."""
     import akshare as ak
-    import pandas as pd
 
     lines: list[str] = []
 
-    # ── Basic quote / ratios from East Money HK screen ───────────────────────
     try:
         df = ak.stock_hk_spot_em()
         row_df = df[df["代码"].astype(str).str.zfill(5) == code]
         if not row_df.empty:
             r = row_df.iloc[0]
-            mapping = {
-                "名称":        "Name",
-                "市盈率(动态)": "PE Ratio",
-                "总市值":      "Market Cap (HKD)",
-                "市净率":      "Price to Book",
-                "股息率(%)":   "Dividend Yield (%)",
-            }
-            for cn, en in mapping.items():
+            for cn, en in {
+                "名称": "Name", "市盈率(动态)": "PE Ratio",
+                "总市值": "Market Cap (HKD)", "市净率": "Price to Book",
+                "股息率(%)": "Dividend Yield (%)",
+            }.items():
                 v = _safe_val(r, cn)
                 if v:
                     lines.append(f"{en}: {v}")
     except Exception as exc:
         logging.debug("AKShare stock_hk_spot_em error for %s: %s", ticker, exc)
 
-    # ── Financial analysis indicators (ROE, ROA, EPS, book value) ────────────
     try:
         year = str(datetime.now().year - 1)
         fin = ak.stock_hk_financial_analysis_indicator(symbol=code, start_year=year)
         if fin is not None and not fin.empty:
             latest = fin.iloc[0]
-            fin_map = {
+            for cn, en in {
                 "净资产收益率": "Return on Equity (%)",
                 "总资产收益率": "Return on Assets (%)",
                 "每股收益":    "EPS",
                 "每股净资产":  "Book Value per Share",
-            }
-            for cn, en in fin_map.items():
+            }.items():
                 v = _safe_val(latest, cn)
                 if v:
                     lines.append(f"{en}: {v}")
@@ -218,26 +207,20 @@ def _do_akshare_hk(code: str, ticker: str) -> list[str]:
 
 
 def _do_akshare_a(code: str, market: str, ticker: str) -> list[str]:
-    """Fetch A-share fundamentals from AKShare. Returns list of 'Label: value' lines."""
     import akshare as ak
 
     lines: list[str] = []
-    prefix = "sh" if market == "sh" else "sz"
-    symbol_str = f"{prefix}{code}"
+    symbol_str = f"{'sh' if market == 'sh' else 'sz'}{code}"
 
-    # ── Individual stock info from East Money ─────────────────────────────────
     try:
         df = ak.stock_individual_info_em(symbol=symbol_str)
         if df is not None and not df.empty:
             df_idx = df.set_index("item") if "item" in df.columns else df
-            mapping = {
-                "市盈率(动态)": "PE Ratio",
-                "市净率":      "Price to Book",
-                "总市值":      "Market Cap",
-                "流通市值":    "Float Market Cap",
-                "ROE":         "Return on Equity",
-            }
-            for cn, en in mapping.items():
+            for cn, en in {
+                "市盈率(动态)": "PE Ratio", "市净率": "Price to Book",
+                "总市值": "Market Cap", "流通市值": "Float Market Cap",
+                "ROE": "Return on Equity",
+            }.items():
                 try:
                     v = _safe_val({"v": df_idx.loc[cn, "value"]}, "v")
                     if v:
@@ -247,19 +230,15 @@ def _do_akshare_a(code: str, market: str, ticker: str) -> list[str]:
     except Exception as exc:
         logging.debug("AKShare stock_individual_info_em error for %s: %s", ticker, exc)
 
-    # ── Financial abstract (EPS, revenue, net income, ROE, D/A) ──────────────
     try:
         fin = ak.stock_financial_abstract(stock=code)
         if fin is not None and not fin.empty:
             latest = fin.iloc[0]
-            abs_map = {
-                "基本每股收益(元)":   "EPS",
-                "营业总收入(元)":     "Revenue",
-                "净利润(元)":         "Net Income",
-                "净资产收益率(%)":    "Return on Equity (%)",
-                "资产负债率(%)":      "Debt to Assets (%)",
-            }
-            for cn, en in abs_map.items():
+            for cn, en in {
+                "基本每股收益(元)": "EPS", "营业总收入(元)": "Revenue",
+                "净利润(元)": "Net Income", "净资产收益率(%)": "Return on Equity (%)",
+                "资产负债率(%)": "Debt to Assets (%)",
+            }.items():
                 v = _safe_val(latest, cn)
                 if v:
                     lines.append(f"{en}: {v}")
@@ -270,12 +249,9 @@ def _do_akshare_a(code: str, market: str, ticker: str) -> list[str]:
 
 
 def _fetch_akshare(ticker: str) -> Optional[str]:
-    """
-    Fetch fundamentals from AKShare with a timeout guard.
-    Returns formatted text or None on failure.
-    """
+    """Fetch fundamentals from AKShare with a timeout guard. Returns text or None."""
     try:
-        import akshare  # noqa: F401  — verify installed
+        import akshare  # noqa: F401
     except ImportError:
         return None
 
@@ -290,8 +266,7 @@ def _fetch_akshare(ticker: str) -> Optional[str]:
 
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_work)
-            lines = future.result(timeout=_AK_TIMEOUT)
+            lines = ex.submit(_work).result(timeout=_AK_TIMEOUT)
     except FuturesTimeout:
         logging.warning("AKShare timed out for %s", ticker)
         return None
@@ -302,31 +277,23 @@ def _fetch_akshare(ticker: str) -> Optional[str]:
     if not lines:
         return None
 
-    header_lines = [
+    return "\n".join([
         f"# Company Fundamentals for {ticker} (via AKShare)",
         f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-    ]
-    return "\n".join(header_lines + lines)
+    ] + lines)
 
 
 # ── LSEG fetcher ──────────────────────────────────────────────────────────────
 def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
-    """
-    Last-resort LSEG fetch — desktop/Workspace session.
-    Returns formatted text or None; never crashes the run.
-    """
+    """Last-resort LSEG fetch — desktop/Workspace session. Never crashes the run."""
     global _lseg_calls
 
     app_key = os.environ.get("EDP_API_KEY", "").strip()
-    if not app_key:
-        return None
-    if not _is_asia(ticker):
+    if not app_key or not _is_asia(ticker):
         return None
     if _lseg_calls >= _LSEG_MAX_CALLS:
-        logging.warning(
-            "LSEG hard cap (%d) reached — skipping %s", _LSEG_MAX_CALLS, ticker
-        )
+        logging.warning("LSEG hard cap (%d) reached — skipping %s", _LSEG_MAX_CALLS, ticker)
         return None
 
     try:
@@ -343,8 +310,7 @@ def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
     time.sleep(_LSEG_RATE_SLEEP)
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_work)
-            df = future.result(timeout=_LSEG_TIMEOUT)
+            df = ex.submit(_work).result(timeout=_LSEG_TIMEOUT)
     except FuturesTimeout:
         logging.warning("LSEG timed out for %s — continuing without", ticker)
         return None
@@ -362,17 +328,17 @@ def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
     ]
 
     if df is not None and not df.empty:
+        import pandas as pd
         row = df.iloc[0]
         for field, label in zip(_LSEG_FIELDS, _LSEG_LABELS):
-            # LSEG column names vary; try exact match then suffix match
             col = next(
-                (c for c in df.columns if c == field or field.endswith(c) or c.endswith(field.split(".")[-1])),
+                (c for c in df.columns
+                 if c == field or c.endswith(field.split(".")[-1])),
                 None,
             )
             if col is None:
                 continue
             try:
-                import pandas as pd
                 val = row[col]
                 if pd.isna(val):
                     continue
@@ -389,30 +355,105 @@ def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
     return "\n".join(lines) if data_lines else None
 
 
+# ── Finnhub news fetcher ──────────────────────────────────────────────────────
+def _fetch_finnhub_news(ticker: str) -> Optional[str]:
+    """Fetch company news from Finnhub. Returns formatted text or None."""
+    global _finnhub_calls
+
+    api_key = os.environ.get("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        return None
+    if _finnhub_calls >= _FINNHUB_MAX_CALLS:
+        logging.warning("Finnhub hard cap (%d) reached — skipping %s", _FINNHUB_MAX_CALLS, ticker)
+        return None
+
+    try:
+        import finnhub  # noqa: F401
+    except ImportError:
+        return None
+
+    def _work():
+        client = finnhub.Client(api_key=api_key)
+        end   = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=_FINNHUB_DAYS_BACK)).strftime("%Y-%m-%d")
+        return client.company_news(ticker.upper(), _from=start, to=end)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            news_list = ex.submit(_work).result(timeout=_FINNHUB_TIMEOUT)
+    except FuturesTimeout:
+        logging.warning("Finnhub timed out for %s", ticker)
+        return None
+    except Exception as exc:
+        logging.warning("Finnhub failed for %s: %s", ticker, exc)
+        return None
+
+    _finnhub_calls += 1
+    _log_finnhub_call(ticker, len(news_list) if news_list else 0, _finnhub_calls)
+
+    if not news_list:
+        return None
+
+    lines = [
+        f"# Company News for {ticker} (via Finnhub — last {_FINNHUB_DAYS_BACK} days)",
+        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# Articles found: {len(news_list)}",
+        "",
+    ]
+    for article in news_list[:10]:
+        headline = article.get("headline", "")
+        summary  = article.get("summary", "")
+        source   = article.get("source", "")
+        ts       = article.get("datetime", 0)
+        try:
+            date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except Exception:
+            date_str = "unknown"
+        lines.append(f"[{date_str}] {source}: {headline}")
+        if summary:
+            lines.append(f"  {summary[:200]}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _news_is_empty(text: Optional[str]) -> bool:
+    """Return True if a news result has no substantive content."""
+    if not text:
+        return True
+    stripped = text.strip()
+    return len(stripped) < 150 or "no news" in stripped.lower()
+
+
 # ── data quality header ───────────────────────────────────────────────────────
-def _quality_header(fund_source: str, completeness: str) -> str:
+def _news_source_label() -> str:
+    """Describe the configured news source for the header."""
+    if os.environ.get("FINNHUB_API_KEY"):
+        return "Finnhub (yFinance fallback)"
+    return "yFinance"
+
+
+def _quality_header(fund_source: str, completeness: str, news_source: Optional[str] = None) -> str:
+    news = news_source or _news_source_label()
     return (
-        "─────────────────────────────────────\n"
+        "─────────────────────────────────────────\n"
         "DATA SOURCES USED FOR THIS ANALYSIS\n"
         f"Price/Technical : yFinance ✓\n"
         f"Fundamentals    : {fund_source}\n"
-        "News/Sentiment  : yFinance\n"
+        f"News/Sentiment  : {news}\n"
         f"Data completeness: {completeness}\n"
-        "─────────────────────────────────────\n\n"
+        "─────────────────────────────────────────\n\n"
     )
 
 
 # ── enhanced get_fundamentals wrapper ────────────────────────────────────────
 def _make_enhanced_fundamentals(original_fn):
-    """
-    Wrap the yfinance get_fundamentals with AKShare + LSEG fallback.
-    Returned callable has the same signature as the original.
-    """
+    """Wrap yfinance get_fundamentals with AKShare + LSEG fallback chain."""
 
     def enhanced(ticker, curr_date=None):
         global _lseg_calls
 
-        # ── Step 1: yFinance (always first) ───────────────────────────────
+        # ── Step 1: yFinance ──────────────────────────────────────────────
         yf_text: Optional[str] = None
         yf_ok = False
         try:
@@ -421,105 +462,133 @@ def _make_enhanced_fundamentals(original_fn):
         except Exception:
             pass
 
-        # ── Fast path: US / non-Asia tickers (no fallback) ────────────────
+        # ── Fast path: US / non-Asia (yFinance is always sufficient) ──────
         if not _is_asia(ticker):
             source = "yFinance ✓" if yf_ok else "yFinance (partial)"
             completeness = "High" if yf_ok else "Medium"
-            header = _quality_header(source, completeness)
-            return header + (yf_text or f"No fundamentals data from yFinance for {ticker}.")
+            return _quality_header(source, completeness) + (
+                yf_text or f"No fundamentals data from yFinance for {ticker}."
+            )
 
-        # ── Step 2: AKShare (for .HK / .SS / .SZ when yFinance incomplete) ─
+        # ── Step 2: AKShare (.HK / .SS / .SZ when yFinance incomplete) ───
         ak_text: Optional[str] = None
         ak_ok = False
         if not yf_ok:
             ak_text = _fetch_akshare(ticker)
             ak_ok = ak_text is not None and _missing_key_fields(ak_text) < 2
 
-        # ── Combine what we have so far ────────────────────────────────────
-        combined_parts = [p for p in (yf_text, ak_text) if p]
-        combined = "\n\n".join(combined_parts)
+        combined = "\n\n".join(p for p in (yf_text, ak_text) if p)
 
         # ── Step 3: LSEG last resort ──────────────────────────────────────
         lseg_text: Optional[str] = None
         lseg_triggered = False
-        app_key = os.environ.get("EDP_API_KEY", "").strip()
-
-        if app_key and _needs_lseg(combined) and _lseg_calls < _LSEG_MAX_CALLS:
+        if (
+            os.environ.get("EDP_API_KEY", "").strip()
+            and _needs_lseg(combined)
+            and _lseg_calls < _LSEG_MAX_CALLS
+        ):
             trigger = (
                 "yfinance_empty+akshare_incomplete"
-                if ak_text
-                else "yfinance_empty+akshare_failed"
+                if ak_text else "yfinance_empty+akshare_failed"
             )
             lseg_text = _fetch_lseg(ticker, trigger)
             lseg_triggered = lseg_text is not None
 
-        # ── Pick best result + build header ───────────────────────────────
+        # ── Pick best result ──────────────────────────────────────────────
         if lseg_triggered:
-            # Merge all three sources
-            all_parts = [p for p in (yf_text, ak_text, lseg_text) if p]
-            best = "\n\n".join(all_parts)
-            source = "yFinance + AKShare + LSEG"
-            completeness = "High"
-
+            best = "\n\n".join(p for p in (yf_text, ak_text, lseg_text) if p)
+            source, completeness = "yFinance + AKShare + LSEG", "High"
         elif ak_ok:
-            # yf partial + ak complete
-            all_parts = [p for p in (yf_text, ak_text) if p]
-            best = "\n\n".join(all_parts)
-            source = "yFinance + AKShare ✓"
-            completeness = "High"
-
+            best = "\n\n".join(p for p in (yf_text, ak_text) if p)
+            source, completeness = "yFinance + AKShare ✓", "High"
         elif ak_text:
-            # Both partial — merge for the agents
-            all_parts = [p for p in (yf_text, ak_text) if p]
-            best = "\n\n".join(all_parts)
-            source = "yFinance + AKShare (partial)"
-            completeness = "Medium"
-
+            best = "\n\n".join(p for p in (yf_text, ak_text) if p)
+            source, completeness = "yFinance + AKShare (partial)", "Medium"
         elif yf_ok:
-            best = yf_text
-            source = "yFinance ✓"
-            completeness = "High"
-
+            best, source, completeness = yf_text, "yFinance ✓", "High"
         elif yf_text:
-            best = yf_text
-            source = "yFinance (partial)"
-            completeness = "Medium"
-
+            best, source, completeness = yf_text, "yFinance (partial)", "Medium"
         else:
             best = f"No fundamentals data available for {ticker} from yFinance, AKShare, or LSEG."
-            source = "None"
-            completeness = "Low"
+            source, completeness = "None", "Low"
 
-        # Log run summary (fires once per ticker per invocation)
         _log_run_summary(ticker, yf_ok, ak_ok, lseg_triggered)
+        return _quality_header(source, completeness) + best
 
-        header = _quality_header(source, completeness)
-        return header + best
-
+    enhanced._enhanced = True  # type: ignore[attr-defined]
     return enhanced
 
 
-# ── apply monkey-patches ──────────────────────────────────────────────────────
+# ── enhanced get_news wrapper ─────────────────────────────────────────────────
+def _make_enhanced_news(original_fn):
+    """
+    Wrap yfinance get_news with Finnhub.
+
+    Asia tickers: Finnhub PRIMARY → yFinance fallback
+    US tickers:   yFinance PRIMARY → Finnhub fallback
+    """
+
+    def enhanced(*args, **kwargs):
+        # The original signature is (ticker, start_date, end_date, ...)
+        ticker = args[0] if args else kwargs.get("ticker", "")
+        api_key = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+        if not api_key:
+            return original_fn(*args, **kwargs)
+
+        if _is_asia(ticker):
+            # Primary: Finnhub
+            fh = _fetch_finnhub_news(ticker)
+            if fh and not _news_is_empty(fh):
+                return fh
+            # Fallback: yFinance
+            try:
+                return original_fn(*args, **kwargs)
+            except Exception:
+                return fh or f"No news available for {ticker}."
+        else:
+            # Primary: yFinance
+            yf_result: Optional[str] = None
+            try:
+                yf_result = original_fn(*args, **kwargs)
+                if yf_result and not _news_is_empty(yf_result):
+                    return yf_result
+            except Exception:
+                pass
+            # Fallback: Finnhub
+            fh = _fetch_finnhub_news(ticker)
+            return fh or yf_result or f"No news available for {ticker}."
+
+    enhanced._enhanced = True  # type: ignore[attr-defined]
+    return enhanced
+
+
+# ── apply all patches ─────────────────────────────────────────────────────────
 def apply_patches() -> None:
     """
-    Replace the yfinance entry in the routing table with the enhanced wrapper.
-    Safe to call multiple times — idempotent (checks for prior patching).
+    Patch the routing table with enhanced fundamentals and (optionally) news.
+    Idempotent — safe to call more than once.
     """
     try:
         import tradingagents.dataflows.interface as iface
 
-        original = iface.VENDOR_METHODS["get_fundamentals"]["yfinance"]
-        if getattr(original, "_enhanced", False):
-            return  # already patched
+        # ── Fundamentals ──────────────────────────────────────────────────
+        orig_fund = iface.VENDOR_METHODS["get_fundamentals"]["yfinance"]
+        if not getattr(orig_fund, "_enhanced", False):
+            iface.VENDOR_METHODS["get_fundamentals"]["yfinance"] = \
+                _make_enhanced_fundamentals(orig_fund)
 
-        enhanced = _make_enhanced_fundamentals(original)
-        enhanced._enhanced = True  # type: ignore[attr-defined]
-        iface.VENDOR_METHODS["get_fundamentals"]["yfinance"] = enhanced
+        # ── News (only when Finnhub key is configured) ────────────────────
+        if os.environ.get("FINNHUB_API_KEY", "").strip():
+            orig_news = iface.VENDOR_METHODS["get_news"]["yfinance"]
+            if not getattr(orig_news, "_enhanced", False):
+                iface.VENDOR_METHODS["get_news"]["yfinance"] = \
+                    _make_enhanced_news(orig_news)
 
         logging.info(
-            "DataEnhancer: HK/China fundamentals fallback active "
-            "(AKShare%s)",
-            " + LSEG" if os.environ.get("EDP_API_KEY") else "",
+            "DataEnhancer: active (AKShare%s%s)",
+            " + LSEG"    if os.environ.get("EDP_API_KEY")     else "",
+            " + Finnhub" if os.environ.get("FINNHUB_API_KEY") else "",
         )
     except Exception as exc:
         logging.warning("DataEnhancer: patch failed — %s", exc)

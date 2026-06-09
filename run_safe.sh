@@ -31,9 +31,10 @@ TIMESTAMP=$(date +%Y-%m-%d_%H-%M)
 CRASH_LOG="outputs/crash_logs/crash_${TIMESTAMP}.txt"
 LOGFILE="outputs/session_${TIMESTAMP}.txt"
 
-# ── Launch with tee + stderr to crash log ─────────────────────────────────
+# ── Launch enhanced with tee + stderr to crash log ────────────────────────
+export USE_DATA_ENHANCER=1
 echo ""
-script -q "$LOGFILE" tradingagents 2>"$CRASH_LOG"
+script -q "$LOGFILE" python kevin_data/launch.py 2>"$CRASH_LOG"
 EXIT_CODE=$?
 echo ""
 

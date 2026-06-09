@@ -36,9 +36,10 @@ rem ---- Crash log with fresh timestamp each run ------------------
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"') do set TIMESTAMP=%%i
 set CRASH_LOG=outputs\crash_logs\crash_%TIMESTAMP%.txt
 
-rem ---- Launch (stderr captured to crash log) --------------------
+rem ---- Launch enhanced (stderr captured to crash log) -----------
+set USE_DATA_ENHANCER=1
 echo.
-tradingagents 2>"%CRASH_LOG%"
+python kevin_data\launch.py 2>"%CRASH_LOG%"
 set EXIT_CODE=%ERRORLEVEL%
 echo.
 

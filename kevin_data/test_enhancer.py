@@ -2,27 +2,42 @@
 Tests for data_enhancer.py — run with:  python -m pytest kevin_data/test_enhancer.py -v
 
 Covers:
-  1. Ticker detection (is_asia)
-  2. AKShare code conversion
-  3. Completeness check
-  4. Non-Asia tickers skip AKShare/LSEG
-  5. LSEG hard-cap at 10 calls
-  6. LSEG skipped when no app key
-  7. Data quality header format
+  1.  Ticker detection (_is_asia)
+  2.  AKShare code conversion
+  3.  Fundamentals completeness check
+  4.  Non-Asia tickers skip AKShare/LSEG
+  5.  HK tickers trigger AKShare when yFinance incomplete
+  6.  LSEG hard-cap at 10 calls
+  7.  LSEG skipped when EDP_API_KEY absent
+  8.  Data quality header format (41-char border, news field)
+  9.  Finnhub: Asia PRIMARY, US SECONDARY
+  10. Finnhub: hard-cap at 20 calls
+  11. Finnhub: skipped when FINNHUB_API_KEY absent
+  12. Finnhub: yFinance fallback when Finnhub returns empty
+  13. News patch idempotency
 """
 
 import os
 import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
-# Make project root importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import kevin_data.data_enhancer as de
 
 
+# ── helpers ────────────────────────────────────────────────────────────────────
+_FULL_FUND = (
+    "PE Ratio: 15.2\nEPS: 4.30\nRevenue: 1000000\n"
+    "Net Income: 200000\nDebt to Equity: 0.5"
+)
+_THIN_FUND = "Name: Tencent\nMarket Cap: 3000000000"
+_FULL_NEWS = "Article " * 40   # >150 chars, not "no news"
+_EMPTY_NEWS = "No news found."
+
+
+# ── 1. ticker helpers ──────────────────────────────────────────────────────────
 class TestTickerHelpers(unittest.TestCase):
     def test_is_asia_hk(self):
         self.assertTrue(de._is_asia("0700.HK"))
@@ -35,148 +50,191 @@ class TestTickerHelpers(unittest.TestCase):
         self.assertTrue(de._is_asia("000858.SZ"))
 
     def test_not_asia(self):
-        self.assertFalse(de._is_asia("NVDA"))
-        self.assertFalse(de._is_asia("AAPL"))
-        self.assertFalse(de._is_asia("GOOGL"))
+        for t in ("NVDA", "AAPL", "GOOGL"):
+            self.assertFalse(de._is_asia(t))
 
     def test_akshare_parts_hk(self):
-        code, market = de._akshare_parts("0700.HK")
-        self.assertEqual(code, "00700")
-        self.assertEqual(market, "hk")
+        self.assertEqual(de._akshare_parts("0700.HK"), ("00700", "hk"))
 
     def test_akshare_parts_hk_short(self):
-        code, market = de._akshare_parts("1000.HK")
-        self.assertEqual(code, "01000")
-        self.assertEqual(market, "hk")
+        self.assertEqual(de._akshare_parts("1000.HK"), ("01000", "hk"))
 
     def test_akshare_parts_ss(self):
-        code, market = de._akshare_parts("600519.SS")
-        self.assertEqual(code, "600519")
-        self.assertEqual(market, "sh")
+        self.assertEqual(de._akshare_parts("600519.SS"), ("600519", "sh"))
 
     def test_akshare_parts_sz(self):
-        code, market = de._akshare_parts("000858.SZ")
-        self.assertEqual(code, "000858")
-        self.assertEqual(market, "sz")
+        self.assertEqual(de._akshare_parts("000858.SZ"), ("000858", "sz"))
 
 
+# ── 2. completeness check ──────────────────────────────────────────────────────
 class TestCompletenessCheck(unittest.TestCase):
-    _FULL = (
-        "PE Ratio: 15.2\nEPS: 4.30\nRevenue: 1000000\n"
-        "Net Income: 200000\nDebt to Equity: 0.5"
-    )
-    _EMPTY = "Name: Tencent\nMarket Cap: 3000000000"
-
     def test_full_data_not_missing(self):
-        self.assertEqual(de._missing_key_fields(self._FULL), 0)
+        self.assertEqual(de._missing_key_fields(_FULL_FUND), 0)
 
     def test_empty_data_all_missing(self):
-        self.assertEqual(de._missing_key_fields(self._EMPTY), 5)
+        self.assertEqual(de._missing_key_fields(_THIN_FUND), 5)
 
-    def test_yf_usable_with_full_data(self):
-        self.assertTrue(de._yf_is_usable(self._FULL))
+    def test_yf_usable_with_full(self):
+        self.assertTrue(de._yf_is_usable(_FULL_FUND))
 
-    def test_yf_not_usable_with_empty(self):
-        self.assertFalse(de._yf_is_usable(self._EMPTY))
+    def test_yf_not_usable_with_thin(self):
+        self.assertFalse(de._yf_is_usable(_THIN_FUND))
 
-    def test_yf_not_usable_error_string(self):
+    def test_yf_not_usable_error(self):
         self.assertFalse(de._yf_is_usable("Error retrieving fundamentals"))
 
     def test_needs_lseg_when_all_missing(self):
-        self.assertTrue(de._needs_lseg(self._EMPTY))
+        self.assertTrue(de._needs_lseg(_THIN_FUND))
 
     def test_no_lseg_when_data_present(self):
-        self.assertFalse(de._needs_lseg(self._FULL))
+        self.assertFalse(de._needs_lseg(_FULL_FUND))
 
 
+# ── 3. data quality header ─────────────────────────────────────────────────────
+class TestQualityHeader(unittest.TestCase):
+    def _get_header(self, fund="yFinance ✓", completeness="High", news=None):
+        return de._quality_header(fund, completeness, news)
+
+    def test_contains_required_sections(self):
+        h = self._get_header()
+        self.assertIn("DATA SOURCES USED FOR THIS ANALYSIS", h)
+        self.assertIn("Price/Technical : yFinance", h)
+        self.assertIn("Fundamentals    :", h)
+        self.assertIn("News/Sentiment  :", h)
+        self.assertIn("Data completeness:", h)
+
+    def test_border_width(self):
+        h = self._get_header()
+        border_line = h.splitlines()[0]
+        self.assertEqual(len(border_line), 41)   # spec: 41 em-dashes
+
+    def test_news_source_passed_through(self):
+        h = self._get_header(news="Finnhub ✓")
+        self.assertIn("Finnhub", h)
+
+    def test_news_source_defaults_without_key(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FINNHUB_API_KEY", None)
+            h = self._get_header()
+        self.assertIn("yFinance", h)
+
+
+# ── 4. fundamentals wrapper ────────────────────────────────────────────────────
 class TestEnhancedFundamentals(unittest.TestCase):
-    def _make_original(self, text):
-        """Helper: return a mock original_fn that returns *text*."""
-        fn = MagicMock(return_value=text)
-        return fn
+    def _fn(self, text):
+        return MagicMock(return_value=text)
 
-    def test_us_ticker_skips_fallbacks(self):
-        """NVDA should get no AKShare/LSEG attempt."""
-        original = self._make_original("PE Ratio: 40\nEPS: 10\nRevenue: 5e10\nNet Income: 2e10\nDebt to Equity: 0.2")
-        enhanced = de._make_enhanced_fundamentals(original)
-
-        with patch.object(de, "_fetch_akshare", wraps=de._fetch_akshare) as mock_ak, \
-             patch.object(de, "_fetch_lseg", wraps=de._fetch_lseg) as mock_lseg:
-            result = enhanced("NVDA", "2026-06-09")
-
-        mock_ak.assert_not_called()
-        mock_lseg.assert_not_called()
-        self.assertIn("DATA SOURCES USED", result)
-        self.assertIn("yFinance", result)
+    def test_us_ticker_skips_akshare_and_lseg(self):
+        enhanced = de._make_enhanced_fundamentals(self._fn(_FULL_FUND))
+        with patch.object(de, "_fetch_akshare") as ak, \
+             patch.object(de, "_fetch_lseg") as lseg:
+            enhanced("NVDA", "2026-06-09")
+        ak.assert_not_called()
+        lseg.assert_not_called()
 
     def test_hk_ticker_tries_akshare_on_incomplete_yf(self):
-        """Incomplete yFinance for 1000.HK should trigger AKShare."""
-        original = self._make_original("Name: Some HK Company\nMarket Cap: 1000000")
-        enhanced = de._make_enhanced_fundamentals(original)
-
-        ak_data = "PE Ratio: 8.5\nEPS: 1.2\nRevenue: 5000000\nNet Income: 800000\nDebt to Equity: 0.3"
-
+        enhanced = de._make_enhanced_fundamentals(self._fn(_THIN_FUND))
+        ak_data = "PE Ratio: 8.5\nEPS: 1.2\nRevenue: 5M\nNet Income: 800K\nDebt to Equity: 0.3"
         with patch.object(de, "_fetch_akshare", return_value=ak_data):
             result = enhanced("1000.HK", "2026-06-09")
-
         self.assertIn("AKShare", result)
         self.assertIn("PE Ratio: 8.5", result)
 
-    def test_lseg_not_triggered_without_app_key(self):
-        """LSEG must NOT fire when EDP_API_KEY is absent."""
-        original = self._make_original("Name: XYZ\nBeta: 1.1")
-        enhanced = de._make_enhanced_fundamentals(original)
-
+    def test_lseg_not_triggered_without_edp_key(self):
+        enhanced = de._make_enhanced_fundamentals(self._fn(_THIN_FUND))
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("EDP_API_KEY", None)
             with patch.object(de, "_fetch_akshare", return_value=None), \
                  patch.object(de, "_fetch_lseg") as mock_lseg:
                 enhanced("0700.HK", "2026-06-09")
-
         mock_lseg.assert_not_called()
 
-    def test_lseg_hard_cap(self):
-        """LSEG must stop after 10 calls regardless of ticker count."""
-        original = self._make_original("")  # always incomplete yf
-
-        de._lseg_calls = 0
-        call_count = 0
-
-        def fake_lseg(ticker, trigger_reason):
-            nonlocal call_count
-            call_count += 1
-            de._lseg_calls += 1
-            return f"PE Ratio: 10 (LSEG mock for {ticker})"
-
-        enhanced = de._make_enhanced_fundamentals(original)
-
-        with patch.dict(os.environ, {"EDP_API_KEY": "fake-key"}):
-            with patch.object(de, "_fetch_akshare", return_value=None), \
-                 patch.object(de, "_fetch_lseg", side_effect=fake_lseg):
-                for i in range(15):
-                    de._lseg_calls = min(de._lseg_calls, 10)  # simulate cap
-                    enhanced(f"{i:04d}.HK", "2026-06-09")
-
-        # The hard cap inside _fetch_lseg prevents calls beyond 10
-        # Here we verify the cap logic would block calls (tested via _fetch_lseg guard)
-        self.assertLessEqual(de._lseg_calls, de._LSEG_MAX_CALLS)
-
-    def test_quality_header_format(self):
-        """Data quality header must contain the required fields."""
-        header = de._quality_header("AKShare ✓", "High")
-        self.assertIn("DATA SOURCES USED FOR THIS ANALYSIS", header)
-        self.assertIn("Price/Technical : yFinance", header)
-        self.assertIn("Fundamentals    : AKShare", header)
-        self.assertIn("News/Sentiment  : yFinance", header)
-        self.assertIn("Data completeness: High", header)
-
     def test_lseg_hard_cap_blocks_at_10(self):
-        """_fetch_lseg must return None when _lseg_calls >= _LSEG_MAX_CALLS."""
         de._lseg_calls = 10
-        with patch.dict(os.environ, {"EDP_API_KEY": "fake-key"}):
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake"}):
             result = de._fetch_lseg("0700.HK", "test")
         self.assertIsNone(result)
-        de._lseg_calls = 0  # reset for other tests
+        de._lseg_calls = 0
+
+    def test_header_in_result(self):
+        enhanced = de._make_enhanced_fundamentals(self._fn(_FULL_FUND))
+        result = enhanced("NVDA")
+        self.assertIn("DATA SOURCES USED FOR THIS ANALYSIS", result)
+
+    def test_enhanced_flag_set(self):
+        fn = de._make_enhanced_fundamentals(self._fn(_FULL_FUND))
+        self.assertTrue(getattr(fn, "_enhanced", False))
+
+
+# ── 5. Finnhub news wrapper ────────────────────────────────────────────────────
+class TestEnhancedNews(unittest.TestCase):
+    def _orig(self, text=_FULL_NEWS):
+        return MagicMock(return_value=text)
+
+    def test_passthrough_without_api_key(self):
+        orig = self._orig()
+        enhanced = de._make_enhanced_news(orig)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FINNHUB_API_KEY", None)
+            enhanced("NVDA", "2026-05-01", "2026-06-09")
+        orig.assert_called_once()
+
+    def test_asia_uses_finnhub_primary(self):
+        enhanced = de._make_enhanced_news(self._orig())
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "fk"}), \
+             patch.object(de, "_fetch_finnhub_news", return_value=_FULL_NEWS) as fh:
+            result = enhanced("0700.HK", "2026-05-01", "2026-06-09")
+        fh.assert_called_once_with("0700.HK")
+        self.assertEqual(result, _FULL_NEWS)
+
+    def test_asia_fallback_to_yfinance_when_finnhub_empty(self):
+        orig = self._orig(_FULL_NEWS)
+        enhanced = de._make_enhanced_news(orig)
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "fk"}), \
+             patch.object(de, "_fetch_finnhub_news", return_value=None):
+            result = enhanced("1000.HK", "2026-05-01", "2026-06-09")
+        orig.assert_called_once()
+
+    def test_us_uses_yfinance_primary(self):
+        orig = self._orig(_FULL_NEWS)
+        enhanced = de._make_enhanced_news(orig)
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "fk"}), \
+             patch.object(de, "_fetch_finnhub_news") as fh:
+            result = enhanced("NVDA", "2026-05-01", "2026-06-09")
+        fh.assert_not_called()
+        self.assertEqual(result, _FULL_NEWS)
+
+    def test_us_falls_back_to_finnhub_when_yf_empty(self):
+        orig = self._orig(_EMPTY_NEWS)
+        enhanced = de._make_enhanced_news(orig)
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "fk"}), \
+             patch.object(de, "_fetch_finnhub_news", return_value=_FULL_NEWS) as fh:
+            result = enhanced("NVDA", "2026-05-01", "2026-06-09")
+        fh.assert_called_once()
+        self.assertEqual(result, _FULL_NEWS)
+
+    def test_finnhub_hard_cap_blocks_at_20(self):
+        de._finnhub_calls = 20
+        with patch.dict(os.environ, {"FINNHUB_API_KEY": "fk"}):
+            result = de._fetch_finnhub_news("0700.HK")
+        self.assertIsNone(result)
+        de._finnhub_calls = 0
+
+    def test_enhanced_flag_set(self):
+        fn = de._make_enhanced_news(self._orig())
+        self.assertTrue(getattr(fn, "_enhanced", False))
+
+
+# ── 6. patch idempotency ───────────────────────────────────────────────────────
+class TestApplyPatches(unittest.TestCase):
+    def test_idempotent(self):
+        """apply_patches() called twice must not double-wrap."""
+        de.apply_patches()
+        import tradingagents.dataflows.interface as iface
+        fn_after_first = iface.VENDOR_METHODS["get_fundamentals"]["yfinance"]
+        de.apply_patches()
+        fn_after_second = iface.VENDOR_METHODS["get_fundamentals"]["yfinance"]
+        self.assertIs(fn_after_first, fn_after_second)
 
 
 if __name__ == "__main__":
