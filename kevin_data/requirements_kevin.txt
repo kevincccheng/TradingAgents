@@ -1,0 +1,9 @@
+# Optional packages for Kevin's HK/China data enhancement
+# Install with: pip install -r kevin_data/requirements_kevin.txt
+
+# AKShare — free fundamentals fallback for HK / A-share tickers
+akshare>=1.12.0
+
+# LSEG Data Library — last-resort fundamentals (requires Eikon/Workspace)
+# Only needed if you have an LSEG app key. Comment out if not using LSEG.
+# lseg-data>=2.0.0

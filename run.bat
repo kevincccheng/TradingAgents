@@ -1,4 +1,108 @@
 @echo off
+rem ── Kevin's enhanced launcher ─────────────────────────────────────────────
+rem   Sets USE_DATA_ENHANCER=1 so the HK/China fundamentals fallback chain
+rem   (AKShare → LSEG) activates automatically for .HK / .SS / .SZ tickers.
+rem   LSEG only fires when LSEG_APP_KEY is present in .env and both yFinance
+rem   and AKShare return incomplete data.  Run is otherwise identical to the
+rem   original run_safe.bat — that file is left untouched.
+rem ─────────────────────────────────────────────────────────────────────────
 pushd "%~dp0"
-call run_safe.bat
+chcp 65001 >nul
+set PYTHONIOENCODING=utf-8
+
+rem ── Data enhancer activation ─────────────────────────────────────────────
+set USE_DATA_ENHANCER=1
+
+if not exist ".venv\Scripts\activate.bat" (
+    echo ERROR: .venv not found. Run setup.bat first.
+    pause
+    popd & exit /b 1
+)
+
+call .venv\Scripts\activate.bat
+
+rem ── Load .env so LSEG_APP_KEY and other keys are available ───────────────
+if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if not "%%A"=="" if not "%%A:~0,1%"=="#" (
+            set "%%A=%%B"
+        )
+    )
+)
+
+if not exist "outputs" mkdir outputs
+if not exist "outputs\crash_logs" mkdir outputs\crash_logs
+set TRADINGAGENTS_RESULTS_DIR=outputs
+
+rem ── API key check ────────────────────────────────────────────────────────
+set KEY_OK=0
+if exist ".env" (
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if /i "%%A"=="ANTHROPIC_API_KEY" if not "%%B"=="" set KEY_OK=1
+    )
+)
+if %KEY_OK%==0 (
+    echo.
+    echo  [!] WARNING: ANTHROPIC_API_KEY not found or empty in .env
+    echo      API credit is SEPARATE from your claude.ai subscription.
+    echo      Top up at: platform.anthropic.com/settings/billing
+    echo.
+)
+
+rem ================================================================
+:run_loop
+rem ── Crash log with fresh timestamp each run ──────────────────────
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH-mm"') do set TIMESTAMP=%%i
+set CRASH_LOG=outputs\crash_logs\crash_%TIMESTAMP%.txt
+
+rem ── Launch enhanced (stderr to crash log) ────────────────────────
+echo.
+python kevin_data\launch.py 2>"%CRASH_LOG%"
+set EXIT_CODE=%ERRORLEVEL%
+echo.
+
+rem ── Post-run handling ────────────────────────────────────────────
+if %EXIT_CODE% neq 0 (
+    echo ============================================
+    echo  Analysis ended with error - exit code: %EXIT_CODE%
+    echo  Crash log: %CRASH_LOG%
+    echo  Attempting to save any partial output...
+    echo ============================================
+    echo.
+    python convert_report.py
+    if errorlevel 1 (
+        echo  No partial output found.
+        echo  Check %CRASH_LOG% for error details.
+    ) else (
+        echo.
+        echo  PDF saved to reports\latest
+        powershell -NoProfile -WindowStyle Hidden -Command "$f = Get-ChildItem 'reports\latest\*.pdf' -EA 0 | Sort-Object LastWriteTime -Desc | Select-Object -First 1 -ExpandProperty FullName; if ($f) { Start-Process msedge $f }"
+    )
+) else (
+    for %%F in ("%CRASH_LOG%") do if %%~zF==0 del "%CRASH_LOG%" 2>nul
+    echo ============================================
+    echo  Generating PDF report...
+    echo  Tip: press Y at the Save report? prompt
+    echo ============================================
+    echo.
+    python convert_report.py
+    if errorlevel 1 (
+        echo  NOTE: No saved report found. Press Y next time.
+    ) else (
+        echo.
+        echo  PDF saved to reports\latest
+        powershell -NoProfile -WindowStyle Hidden -Command "$f = Get-ChildItem 'reports\latest\*.pdf' -EA 0 | Sort-Object LastWriteTime -Desc | Select-Object -First 1 -ExpandProperty FullName; if ($f) { Start-Process msedge $f }"
+    )
+)
+
+rem ── Run again? ───────────────────────────────────────────────────
+echo.
+echo ============================================
+set /p CHOICE=  Run another analysis? [Y/N]:
+if /i "%CHOICE%"=="Y" goto run_loop
+if /i "%CHOICE%"=="y" goto run_loop
+
+echo.
+echo  Session closed. Your PDFs are in reports\latest
+echo ============================================
 popd
