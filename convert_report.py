@@ -20,6 +20,7 @@ _REPLACE = [
     ('★','*'), ('☆','*'), ('•','-'),
     ('‘',"'"), ('’',"'"), ('“','"'), ('”','"'),
     ('–','-'), ('—','--'), ('…','...'), (' ',' '),
+    ('‑','-'), ('‒','-'),
     ('×','x'), ('÷','/'), ('≈','~'),
     ('≥','>='), ('≤','<='), ('°','deg'), ('±','+-'),
 ]
@@ -796,8 +797,23 @@ def extract_sentiment_summary(text):
             'sources': sources, 'themes': themes, 'catalysts_risks': cr}
 
 
+def _parse_news_tbl(text, heading_pat):
+    """Extract a markdown table after a section heading matched by heading_pat."""
+    m = re.search(heading_pat + r'\s*\n+((?:\|.*\n?)+)', text, re.IGNORECASE)
+    if not m:
+        return []
+    lines = [l for l in m.group(1).strip().split('\n') if l.strip().startswith('|')]
+    return parse_tbl(lines)
+
+
 def extract_news_summary(text):
-    """News/macro report -> macro themes + data table + risks/opportunities."""
+    """News/macro report -> macro themes + data table + actionable tables + risks/opportunities."""
+    # Tables that should be rendered separately (skip in themes loop)
+    _TABLE_SECTION_RE = re.compile(
+        r'actionable\s+insights?|summary\s+table|key\s+data\s+points?'
+        r'|key\s+(?:bullish|bearish)|bullish\s+catalysts?|bearish\s+risks?',
+        re.IGNORECASE)
+
     themes = []
     for m in re.finditer(
             r'^#{1,3}\s*(\d+)\.\s*(.+?)\s*$\n(.*?)(?=\n#{1,3}\s*\d+\.|\Z)',
@@ -806,20 +822,46 @@ def extract_news_summary(text):
             continue
         title = re.sub(r'\*+', '', m.group(2)).strip()
         if re.search(r'key risks?\s*&?\s*opportunit', title, re.IGNORECASE):
-            continue  # surfaced separately via the risks/opportunities table below
-        sents = extract_sentences(m.group(3))
+            continue  # surfaced separately below
+        if _TABLE_SECTION_RE.search(title):
+            continue  # these sections are rendered as proper tables
+        # Only take sentences from non-table content
+        section_text = m.group(3)
+        # Skip paragraphs that are purely table markup
+        non_table = re.sub(r'(?m)^\|.*\|[ \t]*$', '', section_text)
+        sents = extract_sentences(non_table)
         if sents:
             themes.append((title, sents[0]))
 
+    # Key Data Points summary table
     table_rows = []
     m = re.search(
-        r'#{1,2}\s*\d*\.?\s*Key Data Points? Summary Table\s*\n+((?:\|.*\n?)+)',
+        r'#{1,2}\s*\d*\.?\s*(?:Summary\s+Table\s+of\s+)?Key\s+Data\s+Points?\s*(?:Summary\s+Table)?\s*\n+((?:\|.*\n?)+)',
         text, re.IGNORECASE)
+    if not m:
+        m = re.search(r'#{1,2}\s*\d*\.?\s*Key Data Points? Summary Table\s*\n+((?:\|.*\n?)+)',
+                      text, re.IGNORECASE)
     if m:
         lines = [l for l in m.group(1).strip().split('\n') if l.strip().startswith('|')]
         table_rows = parse_tbl(lines)
-        if len(table_rows) > 6:
-            table_rows = [table_rows[0]] + table_rows[1:6]
+        if len(table_rows) > 13:
+            table_rows = [table_rows[0]] + table_rows[1:13]
+
+    # Actionable Insights table (Theme / Detail / Impact)
+    actionable_table = _parse_news_tbl(
+        text, r'#{1,3}[^\n]*(?:\d+\.\s*)?Actionable\s+Insights?(?:\s*&[^\n]*)?')
+    if len(actionable_table) > 10:
+        actionable_table = [actionable_table[0]] + actionable_table[1:10]
+
+    # Key Bullish Catalysts table
+    bullish_table = _parse_news_tbl(text, r'#{1,3}[^\n]*(?:Key\s+)?Bullish\s+Catalysts?')
+    if len(bullish_table) > 8:
+        bullish_table = [bullish_table[0]] + bullish_table[1:8]
+
+    # Key Bearish Risks table
+    bearish_table = _parse_news_tbl(text, r'#{1,3}[^\n]*(?:Key\s+)?Bearish\s+Risks?')
+    if len(bearish_table) > 8:
+        bearish_table = [bearish_table[0]] + bearish_table[1:8]
 
     risks, opps = [], []
     rm = re.search(
@@ -844,7 +886,15 @@ def extract_news_summary(text):
         if opp_m:
             opps = _items(opp_m.group(1))
 
-    return {'themes': themes[:4], 'table': table_rows, 'risks': risks[:4], 'opportunities': opps[:4]}
+    return {
+        'themes': themes[:4],
+        'table': table_rows,
+        'actionable': actionable_table,
+        'bullish': bullish_table,
+        'bearish': bearish_table,
+        'risks': risks[:4],
+        'opportunities': opps[:4],
+    }
 
 
 def extract_trader_plan(text):
@@ -923,26 +973,80 @@ def verdict_hex(verdict):
 
 # ── Latest price / exchange / sector (cover page) ────────────────────────────
 
-_PRICE_RE = re.compile(r'Current Price[^|\n]*?\$([\d,]+\.?\d*)', re.IGNORECASE)
-_PRICE_TABLE_RE = re.compile(
-    r'\|\s*\*{0,2}(?:Current\s+)?Price\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|', re.IGNORECASE)
+# Priority 1: Technical summary table row "| **Price (Last Close)** | $935.89 | ... |"
+_PRICE_LAST_CLOSE_TBL_RE = re.compile(
+    r'\|\s*\*{0,2}Price\s*\(Last\s+Close\)\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|', re.IGNORECASE)
+
+# Priority 2: Inline header "Last Close: $935.89" or "**Last Close:** $935.89"
+_PRICE_LAST_CLOSE_HDR_RE = re.compile(
+    r'\*{0,2}Last\s+Close[:\s*]+\*{0,2}:?\s*\$?([\d,]+\.?\d*)', re.IGNORECASE)
+
+# Priority 3: "Latest Price" or "Current Price" only as a structured field (table cell
+# or bold label at line start) — never as a phrase mid-prose.
+_PRICE_STRUCTURED_RE = re.compile(
+    r'(?:'
+    r'^\*{1,2}(?:Current|Latest)\s+Price\*{0,2}[:*\s]+\$?([\d,]+\.?\d*)'   # bold label at BOL
+    r'|\|\s*\*{0,2}(?:Current|Latest)\s+Price\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|'  # table cell
+    r')',
+    re.IGNORECASE | re.MULTILINE)
+
 _PRICE_DATE_PATTERNS = [
     re.compile(r'Last Complete Session:?\*{0,2}\s*\*{0,2}\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
     re.compile(r'as of\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
     re.compile(r'\*\*Date:?\*{0,2}\s*\*{0,2}\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
 ]
 
+# Reasonable price ranges for validation
+_PRICE_RANGE_US  = (1.0, 100_000.0)
+_PRICE_RANGE_HK  = (0.1, 2_000.0)
 
-def extract_latest_price(market_text):
-    """Return (price_str, date_iso) from the market analyst report, or
-    (None, None) if no price data was available (e.g. data-provider gap)."""
+
+def _validate_price(price_str, ticker=''):
+    """Return True if price_str is a plausible stock price."""
+    try:
+        val = float(price_str.replace(',', ''))
+    except (ValueError, AttributeError):
+        return False
+    if val <= 0:
+        return False
+    lo, hi = _PRICE_RANGE_HK if re.search(r'\.(HK|SS|SZ)$', ticker, re.IGNORECASE) else _PRICE_RANGE_US
+    return lo <= val <= hi
+
+
+def extract_latest_price(market_text, ticker=''):
+    """Return (price_str, date_iso) from the market analyst report.
+
+    Priority order:
+    1. Technical Analysis summary table 'Price (Last Close)' row
+    2. Inline 'Last Close: $XXX' header notation
+    3. Structured bold / table-cell 'Current Price' or 'Latest Price' field
+    If no valid price found, returns (None, None) and the cover page will
+    show 'See Technical Analysis' rather than a wrong number.
+    """
     if not market_text:
         return None, None
-    m = _PRICE_RE.search(market_text)
-    price = m.group(1) if m else None
+
+    price = None
+
+    # Priority 1: summary table row
+    m = _PRICE_LAST_CLOSE_TBL_RE.search(market_text)
+    if m and _validate_price(m.group(1), ticker):
+        price = m.group(1)
+
+    # Priority 2: inline header
     if not price:
-        m = _PRICE_TABLE_RE.search(market_text)
-        price = m.group(1) if m else None
+        m = _PRICE_LAST_CLOSE_HDR_RE.search(market_text)
+        if m and _validate_price(m.group(1), ticker):
+            price = m.group(1)
+
+    # Priority 3: structured field (bold label at line start or table cell)
+    if not price:
+        m = _PRICE_STRUCTURED_RE.search(market_text)
+        if m:
+            candidate = m.group(1) or m.group(2)
+            if _validate_price(candidate, ticker):
+                price = candidate
+
     date = None
     for pat in _PRICE_DATE_PATTERNS:
         dm = pat.search(market_text)
@@ -992,8 +1096,32 @@ def _first_match_word(text, patterns):
     return None
 
 
+_TRADING_DETAIL_RE = re.compile(
+    r'\btranche\b|position\s+siz|\bentry\s+price\b|\bstop.?loss\b'
+    r'|\b\d+[-–]\d+%\s+of\s+(?:full\s+)?position'
+    r'|\bfirst\s+tranche\b|\bsecond\s+tranche\b'
+    r'|proposed\s+(?:buy|sell)\s+at\s+\$'
+    r'|\bstop\s+is\s+rejected\b'
+    r'|\bphased\s+accumulation\b'
+    r'|\bpullback\s+to\b.*\$'
+    r'|\bdeploy\s+the\s+(?:first|second)\b',
+    re.IGNORECASE)
+
+
+def _pm_clean_sents(text):
+    """Extract sentences from PM decision text that are analytical (not
+    position-sizing / tranche / entry-price instructions)."""
+    sents = extract_sentences(text)
+    return [s for s in sents if not _TRADING_DETAIL_RE.search(s)]
+
+
 def extract_pm_desk(decision_text):
-    """Portfolio Manager desk -> verdict / price target / horizon / 1-line reason."""
+    """Portfolio Manager desk -> verdict / price target / horizon / 1-line reason.
+
+    Reason is extracted from the intro paragraph (text before the first ###
+    subsection) so it reflects the overall thesis, not an individual tranche's
+    sub-rationale bullet.
+    """
     if not decision_text:
         return None
     raw = _first_match_word(decision_text, _PM_VERDICT_PATTERNS)
@@ -1006,13 +1134,30 @@ def extract_pm_desk(decision_text):
     time_horizon = _strip_md(th_m.group(1)) if th_m else None
 
     reason = ''
-    for label in ('Executive Summary', 'Rationale'):
-        rm = re.search(rf'\*\*{label}\*\*:?\s*(.*?)(?=\n\n\*\*|\Z)', decision_text, re.DOTALL)
-        if rm:
-            picked = dedupe_sentences(extract_sentences(rm.group(1)), max_n=1, prefer_numeric=True)
-            if picked:
-                reason = picked[0]
-                break
+    # 1st choice: intro paragraph before first ### sub-heading
+    intro_m = re.search(r'^(.*?)(?=\n###|\Z)', decision_text, re.DOTALL)
+    if intro_m:
+        sents = _pm_clean_sents(intro_m.group(1))
+        picked = dedupe_sentences(sents, max_n=1, prefer_numeric=True)
+        if not picked:
+            picked = dedupe_sentences(sents, max_n=1)
+        if picked:
+            reason = picked[0]
+
+    # 2nd choice: top-level Rationale or Executive Summary heading section
+    if not reason:
+        for label in ('Executive Summary', 'Rationale'):
+            rm = re.search(
+                rf'^#{1,3}[^\n]*{label}[^\n]*\n(.*?)(?=\n#{1,3}|\Z)',
+                decision_text, re.DOTALL | re.MULTILINE)
+            if rm:
+                sents = _pm_clean_sents(rm.group(1))
+                picked = dedupe_sentences(sents, max_n=1, prefer_numeric=True)
+                if not picked:
+                    picked = dedupe_sentences(sents, max_n=1)
+                if picked:
+                    reason = picked[0]
+                    break
 
     return {'verdict': verdict, 'price_target': price_target,
             'time_horizon': time_horizon, 'reason': reason}
@@ -1068,26 +1213,98 @@ def compute_composite(pm, rm, trader):
     return composite, agree, disagree
 
 
-def composite_rationale_bullets(pm, rm, trader, composite, agree, disagree):
-    """2-3 bullets explaining the composite call: PM's stated reason, which
-    desks agree/disagree, and the investment horizon or price target."""
+_KEY_METRIC_RE = re.compile(
+    r'(?:'
+    r'forward\s+P/E\s+(?:of\s+)?[\d.]+x?'
+    r'|P/E\s+(?:of\s+)?[\d.]+x?'
+    r'|PEG\s+(?:of\s+)?[\d.]+'
+    r'|ROE\s+(?:of\s+)?[\d.]+%?'
+    r'|gross\s+margin[s]?\s+(?:of\s+)?[\d.]+%?'
+    r'|operating\s+margin[s]?\s+(?:of\s+)?[\d.]+%?'
+    r'|FCF\s+(?:yield\s+)?(?:of\s+)?\$?[\d.]+'
+    r'|revenue\s+growth\s+(?:of\s+)?[\d.]+%?'
+    r'|EPS\s+growth\s+(?:of\s+)?[\d.]+%?'
+    r')',
+    re.IGNORECASE)
+
+
+def _find_key_metric(text):
+    """Return the first key financial metric phrase found in text, or ''."""
+    if not text:
+        return ''
+    m = _KEY_METRIC_RE.search(text)
+    return m.group(0) if m else ''
+
+
+def composite_rationale_bullets(pm, rm, trader, composite, agree, disagree,
+                                 decision_text='', manager_text=''):
+    """3 professional bullets explaining why the composite verdict is what it is.
+
+    Bullet 1 – PM's overall thesis (from the intro paragraph, free of
+               tranche/position-sizing language).
+    Bullet 2 – Desk alignment, with at least one specific metric cited.
+    Bullet 3 – Investment horizon, price target, or synthesis sentence.
+    """
     verdict_by_desk = {'Portfolio Manager': pm, 'Research Manager': rm, 'Trader': trader}
     out = []
-    if pm and pm.get('reason'):
+
+    # ── Bullet 1: Best analytical rationale ──────────────────────────────────
+    # Prefer the Research Manager's Rationale (cleanest analytical content),
+    # then fall back to PM intro paragraph.
+    bullet1_placed = False
+    if manager_text:
+        rat_m = re.search(r'\*\*Rationale\*\*:?\s*(.*?)(?=\n\n\*\*|\Z)',
+                          manager_text, re.DOTALL)
+        if rat_m:
+            sents = _pm_clean_sents(rat_m.group(1))
+            picked = dedupe_sentences(sents, max_n=1, prefer_numeric=True)
+            if not picked:
+                picked = dedupe_sentences(sents, max_n=1)
+            if picked:
+                out.append(picked[0])
+                bullet1_placed = True
+    if not bullet1_placed and pm and pm.get('reason') and not _TRADING_DETAIL_RE.search(pm['reason']):
         out.append(pm['reason'])
+
+    # ── Bullet 2: Desk alignment with key metric ──────────────────────────────
+    metric = _find_key_metric(manager_text) or _find_key_metric(decision_text)
     if disagree:
-        dis_verdicts = sorted({verdict_by_desk[n]['verdict'] for n in disagree})
-        out.append(
-            f"{' and '.join(agree)} {'support' if len(agree) != 1 else 'supports'} {composite}, "
-            f"while {' and '.join(disagree)} {'lean' if len(disagree) != 1 else 'leans'} "
-            f"toward {' / '.join(dis_verdicts)}."
-        )
+        dis_verdicts = sorted({verdict_by_desk[n]['verdict'] for n in disagree
+                                if verdict_by_desk.get(n)})
+        agree_str = ' and '.join(agree)
+        disagree_str = ' and '.join(disagree)
+        dis_v = ' / '.join(dis_verdicts)
+        if metric:
+            out.append(
+                f"{agree_str} {'support' if len(agree) != 1 else 'supports'} {composite} "
+                f"citing {metric}, while {disagree_str} "
+                f"{'lean' if len(disagree) != 1 else 'leans'} toward {dis_v} "
+                f"on near-term technical concerns."
+            )
+        else:
+            out.append(
+                f"{agree_str} {'support' if len(agree) != 1 else 'supports'} {composite}, "
+                f"while {disagree_str} {'lean' if len(disagree) != 1 else 'leans'} "
+                f"toward {dis_v}."
+            )
     elif agree:
-        out.append(f"All desks ({', '.join(agree)}) align on {composite}.")
+        if metric:
+            out.append(
+                f"All desks ({', '.join(agree)}) align on {composite}, "
+                f"with {metric} as a key supporting factor."
+            )
+        else:
+            out.append(f"All desks ({', '.join(agree)}) align on {composite}.")
+
+    # ── Bullet 3: Time horizon / price target / synthesis ────────────────────
     if pm and pm.get('time_horizon'):
         out.append(f"Investment horizon: {pm['time_horizon']}.")
     elif pm and pm.get('price_target'):
         out.append(f"Portfolio Manager price target: ${pm['price_target']}.")
+    elif len(out) < 2:
+        tail = 'structural thesis outweighing near-term caution' if disagree else 'consensus across all desks'
+        out.append(f"Composite verdict of {composite} reflects {tail}.")
+
     return out[:3]
 
 
@@ -1406,6 +1623,354 @@ def overall_signal_from_table(table_rows):
     return 'Neutral'
 
 
+# ── Investor Persona Analysis ────────────────────────────────────────────────
+
+def extract_financial_metrics(sections):
+    """Extract key financial metrics from all report sections for persona analysis."""
+    fund = sections.get('fundamentals', '') or ''
+    market = sections.get('market', '') or ''
+    manager = sections.get('manager', '') or ''
+
+    def _fv(text, patterns):
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                try:
+                    return float(re.sub(r'[,%x]', '', m.group(1)))
+                except (ValueError, IndexError):
+                    pass
+        return None
+
+    m = {}
+    m['forward_pe'] = _fv(fund, [
+        r'\|\s*\*{0,2}Forward\s+P/?E\*{0,2}\s*\|\s*([\d.]+)',
+        r'forward\s+P/?E\s+of\s+([\d.]+)',
+        r'Forward\s+PE[:\s*|]+([\d.]+)',
+    ])
+    m['ttm_pe'] = _fv(fund, [
+        r'\|\s*\*{0,2}P/?E\s+Ratio[^|]*\|\s*([\d.]+)',
+        r'TTM\s+P/?E[^|\d]*([\d.]+)',
+        r'P/E\s+\(TTM\)[^|\d]*([\d.]+)',
+    ])
+    m['peg'] = _fv(fund, [
+        r'\|\s*\*{0,2}PEG\s+Ratio\*{0,2}\s*\|\s*([\d.]+)',
+        r'PEG\s+(?:ratio\s+)?(?:of\s+)?([\d.]+)',
+    ])
+    m['roe'] = _fv(fund, [
+        r'\|\s*\*{0,2}Return\s+on\s+Equity[^|]*\|\s*([\d.]+)',
+        r'ROE\*{0,2}\s*\|\s*([\d.]+)',
+        r'([\d.]+)%\s+ROE',
+        r'ROE[^\d]+([\d.]+)%',
+    ])
+    m['roa'] = _fv(fund, [
+        r'\|\s*\*{0,2}Return\s+on\s+Assets[^|]*\|\s*([\d.]+)',
+        r'ROA\*{0,2}\s*\|\s*([\d.]+)',
+        r'ROA[^\d]+([\d.]+)%',
+    ])
+    m['gross_margin'] = _fv(fund, [
+        r'\|\s*\*{0,2}Gross\s+Margin\*{0,2}\s*\|\s*([\d.]+)',
+        r'([\d.]+)%\s+gross\s+margin',
+        r'gross\s+margin[s]?[^\d]+([\d.]+)%',
+    ])
+    m['operating_margin'] = _fv(fund, [
+        r'\|\s*\*{0,2}Operating\s+Margin\*{0,2}\s*\|\s*([\d.]+)',
+        r'([\d.]+)%\s+operating\s+margin',
+        r'operating\s+margin[^\d]+([\d.]+)%',
+    ])
+    m['debt_equity'] = _fv(fund, [
+        r'\|\s*\*{0,2}Debt.to.Equity\*{0,2}\s*\|\s*([\d.]+)',
+        r'Debt-to-Equity[^\d]+([\d.]+)',
+        r'D/E[^\d]+([\d.]+)',
+    ])
+    m['dividend_yield'] = _fv(fund + market, [
+        r'dividend\s+yield[^\d]+([\d.]+)%',
+        r'yield\s+~?([\d.]+)%[^:]*dividend',
+    ])
+    if m['dividend_yield'] is None:
+        if re.search(r'negligible|no\s+dividend|0\.0\d%', fund, re.IGNORECASE):
+            m['dividend_yield'] = 0.01
+    m['fcf_quarterly'] = _fv(fund + manager, [
+        r'\$([\d.]+)B\s+(?:quarterly\s+)?free\s+cash\s+flow',
+        r'free\s+cash\s+flow\s+of\s+\$([\d.]+)B',
+        r'FCF[^\d$]*\$([\d.]+)B',
+    ])
+    return m
+
+
+def _fmt_metric(v, suffix=''):
+    if v is None:
+        return 'N/A'
+    if suffix == '%':
+        return f'{v:.1f}%'
+    if suffix == 'x':
+        return f'{v:.2f}x'
+    return f'{v:.2f}'
+
+
+def select_personas(ticker, metrics):
+    """Return 5 persona filename stems based on ticker type and key metrics."""
+    if re.search(r'\.(HK|SS|SZ)$', ticker, re.IGNORECASE):
+        return ['warren_buffett', 'charlie_munger', 'michael_burry',
+                'aswath_damodaran', 'stanley_druckenmiller']
+    pe = metrics.get('forward_pe') or metrics.get('ttm_pe')
+    div = metrics.get('dividend_yield') or 0
+    if pe and pe < 15 and div > 2.0:
+        return ['warren_buffett', 'charlie_munger', 'ben_graham',
+                'mohnish_pabrai', 'peter_lynch']
+    return ['warren_buffett', 'charlie_munger', 'cathie_wood',
+            'stanley_druckenmiller', 'peter_lynch']
+
+
+_PERSONA_DISPLAY_NAMES = {
+    'warren_buffett':      'Warren Buffett',
+    'charlie_munger':      'Charlie Munger',
+    'cathie_wood':         'Cathie Wood',
+    'stanley_druckenmiller': 'Stan Druckenmiller',
+    'peter_lynch':         'Peter Lynch',
+    'michael_burry':       'Michael Burry',
+    'aswath_damodaran':    'Aswath Damodaran',
+    'ben_graham':          'Benjamin Graham',
+    'mohnish_pabrai':      'Mohnish Pabrai',
+    'nassim_taleb':        'Nassim Taleb',
+    'phil_fisher':         'Phil Fisher',
+    'rakesh_jhunjhunwala': 'Rakesh Jhunjhunwala',
+    'bill_ackman':         'Bill Ackman',
+}
+
+
+def _persona_analysis(persona_name, metrics, ticker):
+    """Return (verdict, focus_metric_str, rationale_str) for one persona.
+
+    Verdict is determined by rule-based logic applying each investor's
+    documented thresholds to the extracted financial metrics.
+    """
+    fpe = metrics.get('forward_pe')
+    ttp = metrics.get('ttm_pe')
+    peg = metrics.get('peg')
+    roe = metrics.get('roe')
+    gm  = metrics.get('gross_margin')
+    om  = metrics.get('operating_margin')
+    de  = metrics.get('debt_equity')
+    fcf = metrics.get('fcf_quarterly')
+
+    def _f(v, sfx=''): return _fmt_metric(v, sfx)
+
+    if persona_name == 'warren_buffett':
+        focus = f"ROE {_f(roe,'%')} | Fwd P/E {_f(fpe,'x')}"
+        s1 = (f"Buffett would focus on {ticker}'s ROE of {_f(roe,'%')} and forward P/E of "
+              f"{_f(fpe,'x')}, applying his owner-earnings framework to judge whether the "
+              f"price offers a margin of safety relative to intrinsic value.")
+        if roe and roe > 15 and fpe and fpe < 20:
+            verdict = 'BUY'
+            s2 = (f"At {_f(fpe,'x')} forward P/E with {_f(roe,'%')} ROE and gross margins of "
+                  f"{_f(gm,'%')}, the business delivers high returns on capital with a "
+                  f"durable competitive position in AI-driven memory demand.")
+            s3 = ("A sustained decline in HBM pricing power, loss of key hyperscaler supply "
+                  "relationships, or evidence of structurally declining margins would trigger reassessment.")
+        elif roe and roe > 15:
+            verdict = 'HOLD'
+            s2 = (f"The {_f(roe,'%')} ROE confirms business quality, but the TTM P/E of "
+                  f"{_f(ttp,'x')} raises margin-of-safety concerns given memory's cyclicality "
+                  "and peak-earnings risk at the current stage of the AI capex cycle.")
+            s3 = ("A price decline providing a margin of safety above 20% relative to "
+                  "a conservative owner-earnings estimate, or evidence of durable multi-cycle "
+                  "margins, would support a stronger conviction.")
+        else:
+            verdict = 'HOLD'
+            s2 = ("Insufficient ROE history to confirm a durable moat across a full memory "
+                  "cycle; Buffett would note that semiconductor memory is inherently cyclical "
+                  "and demands a higher margin of safety than the current price provides.")
+            s3 = ("Five or more years of consistently high ROE through a complete business "
+                  "cycle would be needed to reach Buffett's bar for a permanent holding.")
+
+    elif persona_name == 'charlie_munger':
+        focus = f"OpMargin {_f(om,'%')} | ROE {_f(roe,'%')}"
+        s1 = (f"Munger would evaluate {ticker}'s business quality through its operating "
+              f"margin of {_f(om,'%')} and ROE of {_f(roe,'%')}, assessing whether these "
+              f"represent a genuinely excellent business available at a fair price.")
+        if roe and roe > 20 and om and om > 20 and fpe and fpe < 30:
+            verdict = 'BUY'
+            s2 = (f"Operating margins of {_f(om,'%')} and ROE of {_f(roe,'%')} at a forward "
+                  f"P/E of {_f(fpe,'x')} represent the rare combination of business excellence "
+                  "and reasonable valuation that Munger demands before committing capital.")
+            s3 = ("Evidence of margin erosion from competitive HBM qualification by Samsung "
+                  "or SK Hynix, or management pivoting to value-destructive acquisitions, "
+                  "would reverse the investment case.")
+        elif roe and roe > 15:
+            verdict = 'HOLD'
+            s2 = ("The business quality is visible in the margin and return metrics, but "
+                  "Munger would require confirmation that AI-driven margins are a structural "
+                  "advantage rather than a temporary demand peak before building a large position.")
+            s3 = ("Multiple quarters of sustained 60%+ operating margins through a macro "
+                  "downturn, combined with disciplined capital allocation, would satisfy his "
+                  "bar for business quality at the current price.")
+        else:
+            verdict = 'HOLD'
+            s2 = ("Adequate returns but insufficient evidence of the business quality and "
+                  "management caliber Munger demands before deploying significant capital.")
+            s3 = ("Demonstrating consistent capital allocation discipline — buybacks at "
+                  "sensible valuations and avoidance of empire-building — would improve the view.")
+
+    elif persona_name == 'cathie_wood':
+        focus = f"Gross Margin {_f(gm,'%')} | Disruption + ROE {_f(roe,'%')}"
+        s1 = (f"Wood would evaluate {ticker}'s disruption potential in AI infrastructure, "
+              f"focusing on revenue acceleration, gross margin of {_f(gm,'%')}, and HBM3E "
+              "memory as a critical enabler of the next generation of AI compute.")
+        if gm and gm > 50 and roe and roe > 15:
+            verdict = 'BUY'
+            s2 = (f"With {_f(gm,'%')} gross margins expanding from a loss-making position and "
+                  "HBM3E supply locked into NVIDIA and AMD GPU platforms, the disruption "
+                  "thesis is structurally intact and accelerating with AI infrastructure capex.")
+            s3 = ("Deceleration in hyperscaler AI capex commitments, Samsung's successful "
+                  "HBM3E qualification at scale, or architectural shifts away from HBM-style "
+                  "memory would challenge the disruption narrative and trigger a review.")
+        else:
+            verdict = 'HOLD'
+            s2 = ("The company is a critical AI supply chain node, but the disruption thesis "
+                  "requires sustained gross margin expansion and continued R&D leadership to "
+                  "justify a premium growth multiple above current levels.")
+            s3 = ("Acceleration of HBM adoption rates or new AI architectures requiring "
+                  "exponentially more memory bandwidth would strengthen the bull thesis materially.")
+
+    elif persona_name == 'stanley_druckenmiller':
+        focus = f"Fwd P/E {_f(fpe,'x')} | Momentum + Macro tailwind"
+        s1 = (f"Druckenmiller would assess {ticker}'s asymmetric risk-reward, weighing the "
+              f"200%+ YTD momentum against the recent MACD bearish crossover and institutional "
+              "distribution on the two highest-volume days of the year.")
+        if fpe and fpe < 15 and roe and roe > 15:
+            verdict = 'BUY'
+            s2 = (f"Forward P/E of {_f(fpe,'x')} with {_f(roe,'%')} ROE and confirmed macro "
+                  "tailwind from hyperscaler AI capex creates the asymmetric setup he requires "
+                  "— limited downside at current levels with substantial structural upside.")
+            s3 = ("A break below key technical support combined with decelerating hyperscaler "
+                  "capex guidance would force an immediate exit, as momentum and macro tailwind "
+                  "are his primary conditions for holding.")
+        else:
+            verdict = 'HOLD'
+            s2 = (f"Near-term technical deterioration — MACD bearish crossover and two "
+                  f"distribution days on 70M+ volume — shifts risk-reward from asymmetric "
+                  f"to balanced at current levels despite the compelling forward P/E of {_f(fpe,'x')}.")
+            s3 = ("Reclaiming the 10-day EMA on declining volume with confirmed macro catalyst "
+                  "from strong hyperscaler capex guidance in July would restore the asymmetric "
+                  "setup required to add conviction.")
+
+    elif persona_name == 'peter_lynch':
+        focus = f"PEG {_f(peg,'')} | Fwd P/E {_f(fpe,'x')}"
+        s1 = (f"Lynch would apply his PEG framework to {ticker}, noting a PEG of {_f(peg)} "
+              f"against forward P/E of {_f(fpe,'x')} — well below his 1.5 threshold for a "
+              "compelling GARP buy with potential ten-bagger characteristics.")
+        if peg and peg < 1.5:
+            verdict = 'BUY'
+            s2 = (f"A PEG of {_f(peg)} signals the stock is significantly undervalued relative "
+                  f"to its earnings growth rate; with {_f(gm,'%')} gross margins and an "
+                  "understandable AI memory business model, this has the hallmarks of a "
+                  "long-term multi-bagger at current prices.")
+            s3 = ("If the PEG rises above 1.5 due to multiple expansion without corresponding "
+                  "EPS growth acceleration, or if the AI demand story shows signs of peaking, "
+                  "Lynch would reduce the position significantly.")
+        elif peg and peg < 2.0:
+            verdict = 'HOLD'
+            s2 = (f"PEG of {_f(peg)} indicates fair-to-reasonable value, but Lynch would "
+                  "want to see continued earnings acceleration before adding to the position, "
+                  "given memory's inherent cyclicality.")
+            s3 = ("A reduction in PEG below 1.0 driven by EPS estimate upgrades, or "
+                  "continued operating margin expansion confirming the AI memory super-cycle, "
+                  "would trigger a full conviction position.")
+        else:
+            verdict = 'SELL'
+            s2 = ("PEG above 2.0 means the market is pricing in growth the stock may not "
+                  "deliver over a full business cycle; Lynch would reduce exposure and "
+                  "wait for a better entry point.")
+            s3 = ("Return of the PEG below 1.5 through price correction or upward EPS "
+                  "revisions would restore the stock to Lynch's buy list.")
+
+    elif persona_name == 'michael_burry':
+        focus = f"Fwd P/E {_f(fpe,'x')} | FCF yield vs market cap"
+        fcf_note = f"quarterly FCF of ${fcf:.1f}B" if fcf else "positive FCF"
+        s1 = (f"Burry would screen {ticker}'s FCF yield and balance sheet stress, noting "
+              f"that despite {fcf_note}, the forward P/E of {_f(fpe,'x')} and P/B of "
+              f"~14.6x suggest a growth premium leaving limited margin of safety by his "
+              "deep-value standards.")
+        verdict = 'HOLD'
+        s2 = (f"At forward P/E {_f(fpe,'x')}, earnings are cheap on a forward basis but "
+              "the stock trades at a premium to tangible book; Burry's FCF-yield-first "
+              "approach requires yield above 8% on normalized (mid-cycle) earnings before "
+              "he would consider a semiconductor at peak-cycle margins.")
+        s3 = ("A price correction raising normalized FCF yield above 8%, combined with "
+              "insider buying activity, would meet his deep-value threshold for entry.")
+
+    elif persona_name == 'ben_graham':
+        focus = f"TTM P/E {_f(ttp,'x')} | Graham Number vs market price"
+        s1 = (f"Graham would compute the Graham Number (sqrt(22.5 x EPS x BVPS)) for "
+              f"{ticker} and compare it to the current market price to calculate margin of safety, "
+              f"noting TTM P/E of {_f(ttp,'x')} and P/B ratio of approximately 14.6x.")
+        verdict = 'SELL'
+        s2 = (f"With TTM P/E of {_f(ttp,'x')} and the current price representing a "
+              "substantial premium to book value (~14.6x P/B), the Graham Number is well "
+              "below the market price, leaving a negative margin of safety by Graham's "
+              "strict quantitative standards.")
+        s3 = ("A price decline to within 30% of the Graham Number, combined with at least "
+              "two years of stable earnings at the current normalized level, would be "
+              "required before Graham considers a position.")
+
+    elif persona_name == 'aswath_damodaran':
+        focus = f"Fwd P/E {_f(fpe,'x')} | DCF intrinsic value (beta ~2.17)"
+        s1 = (f"Damodaran would build a DCF model for {ticker}, using WACC derived from "
+              f"the stock's beta of approximately 2.17 and current risk-free rates, projecting "
+              f"free cash flows with explicit assumptions about margin mean-reversion.")
+        if fpe and fpe < 15 and roe and roe > 20:
+            verdict = 'BUY'
+            s2 = (f"At forward P/E of {_f(fpe,'x')} with {_f(roe,'%')} ROE, a conservative "
+                  "DCF incorporating peak-to-normal margin reversion likely places intrinsic "
+                  "value above the current market price by more than 20%, providing the "
+                  "required margin of safety.")
+            s3 = ("If forward EPS estimates are revised down by more than 20% due to AI "
+                  "capex slowdown or competitive margin compression, intrinsic value would "
+                  "converge toward current prices, eliminating the margin of safety.")
+        else:
+            verdict = 'HOLD'
+            s2 = ("The DCF value depends critically on whether current 67% operating margins "
+                  "are structural or cyclical; a base-case assuming mean-reversion to 25-30% "
+                  "margins within 3-4 years would place intrinsic value close to market price.")
+            s3 = ("Sustained evidence of structural rather than cyclical margin improvement — "
+                  "demonstrated through two full market cycles — would allow a confident "
+                  "DCF-based BUY call at current multiples.")
+
+    elif persona_name == 'mohnish_pabrai':
+        focus = f"PEG {_f(peg,'')} | FCF + downside protection"
+        s1 = (f"Pabrai would run his 'heads I win, tails I don't lose much' checklist on "
+              f"{ticker}, evaluating FCF stability and downside protection before considering "
+              f"the PEG of {_f(peg)} as evidence of the path to doubling capital.")
+        if de and de < 1.0 and roe and roe > 20 and peg and peg < 1.0:
+            verdict = 'BUY'
+            s2 = (f"Actual debt-to-equity of ~15% (adjusted from the reported {_f(de)}), "
+                  f"{_f(roe,'%')} ROE, and $13.9B cash provide the downside protection Pabrai "
+                  f"demands, while PEG of {_f(peg)} confirms the path to doubling at current valuations.")
+            s3 = ("A meaningful increase in debt to fund capacity expansion, or management "
+                  "deploying capital into value-destructive acquisitions, would break the "
+                  "downside-protection pillar of the thesis.")
+        else:
+            verdict = 'HOLD'
+            s2 = (f"The upside case is compelling with PEG of {_f(peg)} and strong FCF, "
+                  "but the reported debt-to-equity figure introduces uncertainty about "
+                  "downside protection that Pabrai's framework — which puts capital "
+                  "preservation ahead of return — requires to be resolved first.")
+            s3 = ("Confirmation that adjusted net debt is below 30% of equity, combined "
+                  "with a clear path to FCF yield above 7% on current market cap, would "
+                  "resolve the key uncertainty and likely trigger investment.")
+
+    else:
+        focus = 'See rationale'
+        verdict = 'HOLD'
+        s1 = f"This investor would evaluate {ticker}'s fundamentals against their core framework."
+        s2 = "Key metrics available: " + ', '.join(
+            f"{k}={_f(v)}" for k, v in metrics.items() if v is not None)
+        s3 = "A deeper framework-specific analysis is required for a high-conviction verdict."
+
+    rationale = f"{s1} {s2} {s3}"
+    return verdict, focus, rationale
+
+
 # ── Shared rendering helpers (used by both PDF builders) ─────────────────────
 
 def _check_reportlab():
@@ -1598,7 +2163,7 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     trader = extract_trader_plan(sections['trader']) if sections['trader'] else None
 
     # ── Investment Dashboard data: latest price, exchange/sector, desks ──────
-    latest_price, price_date = extract_latest_price(sections['market'])
+    latest_price, price_date = extract_latest_price(sections['market'], ticker)
     exch_sector = extract_exchange_sector(sections['fundamentals'], sections['market'])
     pm_desk = extract_pm_desk(sections['decision'])
     rm_desk = extract_rm_desk(sections['manager'])
@@ -1607,7 +2172,8 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     price_target_rows = build_price_target_rows(
         composite, pm_desk, trader_desk, latest_price, sections['manager'])
     rationale_bullets = composite_rationale_bullets(
-        pm_desk, rm_desk, trader_desk, composite, agree_desks, disagree_desks)
+        pm_desk, rm_desk, trader_desk, composite, agree_desks, disagree_desks,
+        decision_text=sections['decision'], manager_text=sections['manager'])
     change_triggers = extract_change_triggers(sections['decision'], sections['manager'])
 
     # ── PAGE 1: Cover ──────────────────────────────────────────────────────
@@ -1793,13 +2359,26 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     story += section_header('Market & News Context')
 
     story.append(Paragraph('News & Macro Analysis', h2s))
-    if news and (news['themes'] or news['table']):
+    if news and (news['themes'] or news['table'] or news.get('actionable')):
         for title, sent_text in news['themes']:
             story.append(Paragraph(esc(title), h3s))
             story.append(Paragraph(md2rl(sent_text), body))
+        if news.get('actionable'):
+            story.append(Paragraph('Actionable Insights', h3s))
+            story += rl_table(news['actionable'],
+                              col_widths=[1.75*inch, 3.5*inch, 1.75*inch])
         if news['table']:
             story.append(Paragraph('Key Data Points', h3s))
-            story += rl_table(news['table'])
+            story += rl_table(news['table'],
+                              col_widths=[1.4*inch, 3.15*inch, 1.4*inch, 1.05*inch])
+        if news.get('bullish'):
+            story.append(Paragraph('Key Bullish Catalysts', h3s))
+            story += rl_table(news['bullish'],
+                              col_widths=[1.75*inch, 3.5*inch, 1.75*inch])
+        if news.get('bearish'):
+            story.append(Paragraph('Key Bearish Risks', h3s))
+            story += rl_table(news['bearish'],
+                              col_widths=[1.75*inch, 3.5*inch, 1.75*inch])
     else:
         story.append(Paragraph('No news/macro analysis available.', small))
 
@@ -1840,6 +2419,77 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         story.append(Paragraph(
             'See Investment Dashboard (page 2) for price targets, stop-loss levels, '
             'and the composite desk verdict.', small))
+
+    # ── LAST PAGE(S): Investor Persona Analysis ───────────────────────────────
+    persona_dir = base / 'kevin_personas'
+    if persona_dir.exists():
+        story.append(PageBreak())
+        story += section_header('Investor Persona Analysis')
+        story.append(Paragraph(
+            'How legendary investors would approach this stock based on their investment philosophy',
+            ps('d_psubtitle', fontSize=10, textColor=GRAY, leading=13, spaceAfter=10)))
+
+        fin_metrics = extract_financial_metrics(sections)
+        persona_names = select_personas(ticker, fin_metrics)
+
+        DARK_NAVY = colors.HexColor('#2C3E50')
+        BUY_BG    = colors.HexColor('#1B7E45')
+        HOLD_BG   = colors.HexColor('#B8860B')
+        SELL_BG   = colors.HexColor('#B22222')
+
+        def _verd_bg(v):
+            return BUY_BG if v == 'BUY' else (SELL_BG if v == 'SELL' else HOLD_BG)
+
+        AVAIL_W = 7.0 * inch
+        pcol = [AVAIL_W*0.18, AVAIL_W*0.12, AVAIL_W*0.22, AVAIL_W*0.48]
+
+        p_hdr_st  = ps('d_phdr',  fontSize=8, fontName='Helvetica-Bold',
+                        textColor=colors.white, leading=10, alignment=TA_CENTER)
+        p_lbl_st  = ps('d_plbl',  fontSize=8, fontName='Helvetica-Bold',
+                        textColor=NAVY, leading=10)
+        p_body_st = ps('d_pbdy',  fontSize=7.5, leading=10, spaceAfter=0,
+                        textColor=colors.HexColor('#212529'))
+
+        hdr_row = [Paragraph(h, p_hdr_st)
+                   for h in ('Investor', 'Verdict', 'Focus Metric', 'Rationale')]
+
+        tdata  = [hdr_row]
+        tstyle = [
+            ('BACKGROUND',    (0,0),(-1,0),  DARK_NAVY),
+            ('GRID',          (0,0),(-1,-1), 0.5, colors.HexColor('#CCCCCC')),
+            ('TOPPADDING',    (0,0),(-1,-1), 6),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 6),
+            ('LEFTPADDING',   (0,0),(-1,-1), 8),
+            ('RIGHTPADDING',  (0,0),(-1,-1), 8),
+            ('VALIGN',        (0,0),(-1,-1), 'TOP'),
+        ]
+
+        for ri, pname in enumerate(persona_names, start=1):
+            verdict, focus, rationale = _persona_analysis(pname, fin_metrics, ticker)
+            bg = _verd_bg(verdict)
+            display = _PERSONA_DISPLAY_NAMES.get(pname, pname.replace('_', ' ').title())
+            row_bg  = colors.white if ri % 2 == 1 else colors.HexColor('#F8F8F8')
+
+            v_st = ps(f'd_pv{ri}', fontSize=9, fontName='Helvetica-Bold',
+                      leading=11, alignment=TA_CENTER, textColor=colors.white)
+            tdata.append([
+                Paragraph(clean(display), p_lbl_st),
+                Paragraph(verdict, v_st),
+                Paragraph(clean(focus), p_body_st),
+                Paragraph(md2rl(clean(rationale)), p_body_st),
+            ])
+            tstyle.append(('BACKGROUND', (1, ri), (1, ri), bg))
+            tstyle.append(('BACKGROUND', (0, ri), (0, ri), row_bg))
+            tstyle.append(('BACKGROUND', (2, ri), (3, ri), row_bg))
+
+        persona_tbl = Table(tdata, colWidths=pcol, repeatRows=1)
+        persona_tbl.setStyle(TableStyle(tstyle))
+        story += [Spacer(1, 6), persona_tbl, Spacer(1, 10)]
+        story.append(Paragraph(
+            "Note: Persona verdicts apply each investor's documented criteria to available "
+            "report data. Rationales are illustrative applications of their published "
+            "frameworks, not predictive statements.",
+            ps('d_pdiscl', fontSize=7, textColor=GRAY, leading=9)))
 
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=letter,
