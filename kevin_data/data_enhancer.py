@@ -10,6 +10,13 @@ FUNDAMENTALS fallback order (.HK / .SS / .SZ only):
   3. LSEG      — last resort; only if EDP_API_KEY set + both above incomplete
                  Hard cap: 10 LSEG calls/run. Rate limit: 2 s between calls.
 
+PRICE / TECHNICAL INDICATORS fallback order (.HK / .SS / .SZ only):
+  1. yFinance  — yf.download() OHLCV
+  2. AKShare   — stock_hk_hist / stock_zh_a_hist if yFinance is empty
+  3. LSEG      — ld.get_history(), last resort, requires EDP_API_KEY
+  Indicators are calculated locally via pandas-ta from whichever OHLCV
+  source above succeeded. See kevin_data/price_indicators.py.
+
 NEWS fallback order:
   Asia tickers (.HK / .SS / .SZ):
     Finnhub PRIMARY → yFinance fallback   (when FINNHUB_API_KEY set)
@@ -29,6 +36,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+from . import price_indicators as _pi
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 _PROJECT_ROOT = Path(__file__).parent.parent
@@ -67,6 +76,11 @@ _LSEG_LABELS = [
 # ── per-run mutable state ─────────────────────────────────────────────────────
 _lseg_calls:    int = 0
 _finnhub_calls: int = 0
+
+# Per-ticker source tracking for the data-quality header (best effort: filled
+# in as get_stock_data / get_indicators are called during the run).
+_price_source:     dict[str, str] = {}
+_indicator_source: dict[str, str] = {}
 
 
 # ── ticker helpers ────────────────────────────────────────────────────────────
@@ -433,17 +447,89 @@ def _news_source_label() -> str:
     return "yFinance"
 
 
-def _quality_header(fund_source: str, completeness: str, news_source: Optional[str] = None) -> str:
+def _quality_header(ticker: str, fund_source: str, completeness: str, news_source: Optional[str] = None) -> str:
     news = news_source or _news_source_label()
+    price_source = _price_source.get(ticker, "yFinance")
+    indicator_source = _indicator_source.get(ticker, price_source)
+    price_label = f"{price_source} ✓" if price_source != "none" else "unavailable"
     return (
         "─────────────────────────────────────────\n"
         "DATA SOURCES USED FOR THIS ANALYSIS\n"
-        f"Price/Technical : yFinance ✓\n"
+        f"Price/Technical : {price_label}\n"
         f"Fundamentals    : {fund_source}\n"
         f"News/Sentiment  : {news}\n"
+        f"Indicators      : Calculated from {indicator_source}\n"
         f"Data completeness: {completeness}\n"
         "─────────────────────────────────────────\n\n"
     )
+
+
+# ── enhanced get_stock_data wrapper ──────────────────────────────────────────
+def _make_enhanced_stock_data(original_fn):
+    """
+    Wrap get_stock_data (yfinance/alpha_vantage slots) with a
+    yFinance -> AKShare -> LSEG OHLCV waterfall for .HK/.SS/.SZ tickers.
+
+    Non-Asia tickers pass straight through to the original implementation.
+    """
+
+    def enhanced(symbol, start_date, end_date):
+        if not _is_asia(symbol):
+            return original_fn(symbol, start_date, end_date)
+
+        df, source = _pi.fetch_price_data(symbol, start_date, end_date)
+        if df is None or df.empty:
+            _price_source[symbol] = "none"
+            from tradingagents.dataflows.symbol_utils import NoMarketDataError
+            raise NoMarketDataError(
+                symbol, symbol,
+                "no OHLCV data from yFinance, AKShare, or LSEG",
+            )
+
+        _price_source[symbol] = source
+        return _pi.format_price_csv(df, symbol, start_date, end_date, source)
+
+    enhanced._enhanced = True  # type: ignore[attr-defined]
+    return enhanced
+
+
+# ── enhanced get_indicators wrapper ──────────────────────────────────────────
+def _make_enhanced_indicators(original_fn):
+    """
+    Wrap get_indicators (yfinance/alpha_vantage slots) for .HK/.SS/.SZ tickers:
+    fetch OHLCV via the yFinance -> AKShare -> LSEG waterfall, then compute the
+    requested indicator locally with pandas-ta.
+
+    Non-Asia tickers pass straight through to the original implementation.
+    """
+
+    def enhanced(symbol, indicator, curr_date, look_back_days=30):
+        if not _is_asia(symbol):
+            return original_fn(symbol, indicator, curr_date, look_back_days)
+
+        start_date, end_date = _pi.indicator_fetch_window(curr_date, look_back_days)
+        min_rows = _pi.indicator_min_rows(indicator, look_back_days)
+        df, source = _pi.fetch_price_data(symbol, start_date, end_date, min_rows=min_rows)
+        if df is None or df.empty:
+            _indicator_source[symbol] = "none"
+            from tradingagents.dataflows.symbol_utils import NoMarketDataError
+            raise NoMarketDataError(
+                symbol, symbol,
+                f"no OHLCV data to calculate {indicator}",
+            )
+
+        try:
+            result = _pi.format_indicator_output(df, indicator, curr_date, look_back_days, source)
+        except Exception as exc:
+            logging.warning("Indicator calc failed for %s/%s: %s", symbol, indicator, exc)
+            _indicator_source[symbol] = source
+            return f"NO_DATA_AVAILABLE: failed to calculate {indicator} for {symbol}: {exc}"
+
+        _indicator_source[symbol] = source
+        return result
+
+    enhanced._enhanced = True  # type: ignore[attr-defined]
+    return enhanced
 
 
 # ── enhanced get_fundamentals wrapper ────────────────────────────────────────
@@ -466,7 +552,7 @@ def _make_enhanced_fundamentals(original_fn):
         if not _is_asia(ticker):
             source = "yFinance ✓" if yf_ok else "yFinance (partial)"
             completeness = "High" if yf_ok else "Medium"
-            return _quality_header(source, completeness) + (
+            return _quality_header(ticker, source, completeness) + (
                 yf_text or f"No fundamentals data from yFinance for {ticker}."
             )
 
@@ -513,7 +599,7 @@ def _make_enhanced_fundamentals(original_fn):
             source, completeness = "None", "Low"
 
         _log_run_summary(ticker, yf_ok, ak_ok, lseg_triggered)
-        return _quality_header(source, completeness) + best
+        return _quality_header(ticker, source, completeness) + best
 
     enhanced._enhanced = True  # type: ignore[attr-defined]
     return enhanced
@@ -571,6 +657,20 @@ def apply_patches() -> None:
     """
     try:
         import tradingagents.dataflows.interface as iface
+
+        # ── Price / OHLCV (get_stock_data) ─────────────────────────────────
+        for vendor in ("yfinance", "alpha_vantage"):
+            orig_stock = iface.VENDOR_METHODS["get_stock_data"][vendor]
+            if not getattr(orig_stock, "_enhanced", False):
+                iface.VENDOR_METHODS["get_stock_data"][vendor] = \
+                    _make_enhanced_stock_data(orig_stock)
+
+        # ── Technical indicators (get_indicators) ──────────────────────────
+        for vendor in ("yfinance", "alpha_vantage"):
+            orig_ind = iface.VENDOR_METHODS["get_indicators"][vendor]
+            if not getattr(orig_ind, "_enhanced", False):
+                iface.VENDOR_METHODS["get_indicators"][vendor] = \
+                    _make_enhanced_indicators(orig_ind)
 
         # ── Fundamentals ──────────────────────────────────────────────────
         orig_fund = iface.VENDOR_METHODS["get_fundamentals"]["yfinance"]

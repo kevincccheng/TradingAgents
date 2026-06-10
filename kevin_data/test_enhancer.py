@@ -22,9 +22,12 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import kevin_data.data_enhancer as de
+from tradingagents.dataflows.symbol_utils import NoMarketDataError
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -92,8 +95,8 @@ class TestCompletenessCheck(unittest.TestCase):
 
 # ── 3. data quality header ─────────────────────────────────────────────────────
 class TestQualityHeader(unittest.TestCase):
-    def _get_header(self, fund="yFinance ✓", completeness="High", news=None):
-        return de._quality_header(fund, completeness, news)
+    def _get_header(self, ticker="AAPL", fund="yFinance ✓", completeness="High", news=None):
+        return de._quality_header(ticker, fund, completeness, news)
 
     def test_contains_required_sections(self):
         h = self._get_header()
@@ -101,6 +104,7 @@ class TestQualityHeader(unittest.TestCase):
         self.assertIn("Price/Technical : yFinance", h)
         self.assertIn("Fundamentals    :", h)
         self.assertIn("News/Sentiment  :", h)
+        self.assertIn("Indicators      : Calculated from", h)
         self.assertIn("Data completeness:", h)
 
     def test_border_width(self):
@@ -235,6 +239,130 @@ class TestApplyPatches(unittest.TestCase):
         de.apply_patches()
         fn_after_second = iface.VENDOR_METHODS["get_fundamentals"]["yfinance"]
         self.assertIs(fn_after_first, fn_after_second)
+
+    def test_stock_data_and_indicators_patched(self):
+        de.apply_patches()
+        import tradingagents.dataflows.interface as iface
+        for vendor in ("yfinance", "alpha_vantage"):
+            self.assertTrue(getattr(iface.VENDOR_METHODS["get_stock_data"][vendor], "_enhanced", False))
+            self.assertTrue(getattr(iface.VENDOR_METHODS["get_indicators"][vendor], "_enhanced", False))
+
+
+# ── 7. get_stock_data wrapper ───────────────────────────────────────────────────
+class TestEnhancedStockData(unittest.TestCase):
+    def setUp(self):
+        de._price_source.clear()
+        de._indicator_source.clear()
+
+    def _df(self, n=5):
+        idx = pd.date_range("2026-05-01", periods=n, freq="D")
+        return pd.DataFrame({
+            "Open": [1.0] * n, "High": [1.0] * n, "Low": [1.0] * n,
+            "Close": [1.0] * n, "Volume": [100] * n,
+        }, index=idx)
+
+    def test_us_ticker_passthrough(self):
+        orig = MagicMock(return_value="us-data")
+        enhanced = de._make_enhanced_stock_data(orig)
+        result = enhanced("NVDA", "2026-05-01", "2026-06-09")
+        orig.assert_called_once_with("NVDA", "2026-05-01", "2026-06-09")
+        self.assertEqual(result, "us-data")
+
+    def test_hk_ticker_uses_price_waterfall(self):
+        orig = MagicMock()
+        enhanced = de._make_enhanced_stock_data(orig)
+        with patch.object(de._pi, "fetch_price_data", return_value=(self._df(), "AKShare")):
+            result = enhanced("0100.HK", "2026-05-01", "2026-06-09")
+        orig.assert_not_called()
+        self.assertIn("Source: AKShare", result)
+        self.assertEqual(de._price_source["0100.HK"], "AKShare")
+
+    def test_hk_ticker_no_data_raises_no_market_data(self):
+        orig = MagicMock()
+        enhanced = de._make_enhanced_stock_data(orig)
+        with patch.object(de._pi, "fetch_price_data", return_value=(None, "none")):
+            with self.assertRaises(NoMarketDataError):
+                enhanced("0100.HK", "2026-05-01", "2026-06-09")
+        self.assertEqual(de._price_source["0100.HK"], "none")
+
+    def test_enhanced_flag_set(self):
+        fn = de._make_enhanced_stock_data(MagicMock())
+        self.assertTrue(getattr(fn, "_enhanced", False))
+
+
+# ── 8. get_indicators wrapper ───────────────────────────────────────────────────
+class TestEnhancedIndicators(unittest.TestCase):
+    def setUp(self):
+        de._price_source.clear()
+        de._indicator_source.clear()
+
+    def _df(self, n=60):
+        idx = pd.date_range("2026-04-01", periods=n, freq="D")
+        return pd.DataFrame({
+            "Open": [1.0] * n, "High": [1.0] * n, "Low": [1.0] * n,
+            "Close": [1.0] * n, "Volume": [100] * n,
+        }, index=idx)
+
+    def test_us_ticker_passthrough(self):
+        orig = MagicMock(return_value="us-indicator")
+        enhanced = de._make_enhanced_indicators(orig)
+        result = enhanced("NVDA", "rsi", "2026-06-09", 30)
+        orig.assert_called_once_with("NVDA", "rsi", "2026-06-09", 30)
+        self.assertEqual(result, "us-indicator")
+
+    def test_hk_ticker_computes_indicator(self):
+        orig = MagicMock()
+        enhanced = de._make_enhanced_indicators(orig)
+        with patch.object(de._pi, "fetch_price_data", return_value=(self._df(), "yFinance")), \
+             patch.object(de._pi, "format_indicator_output", return_value="## rsi values ..."):
+            result = enhanced("0700.HK", "rsi", "2026-06-09", 7)
+        orig.assert_not_called()
+        self.assertEqual(result, "## rsi values ...")
+        self.assertEqual(de._indicator_source["0700.HK"], "yFinance")
+
+    def test_hk_ticker_no_data_raises_no_market_data(self):
+        orig = MagicMock()
+        enhanced = de._make_enhanced_indicators(orig)
+        with patch.object(de._pi, "fetch_price_data", return_value=(None, "none")):
+            with self.assertRaises(NoMarketDataError):
+                enhanced("0100.HK", "close_200_sma", "2026-06-09", 7)
+        self.assertEqual(de._indicator_source["0100.HK"], "none")
+
+    def test_hk_ticker_insufficient_history_returns_no_data_available(self):
+        orig = MagicMock()
+        enhanced = de._make_enhanced_indicators(orig)
+        with patch.object(de._pi, "fetch_price_data", return_value=(self._df(), "AKShare")), \
+             patch.object(de._pi, "format_indicator_output", side_effect=ValueError("insufficient price history (60 row(s)) to compute close_200_sma")):
+            result = enhanced("0100.HK", "close_200_sma", "2026-06-09", 7)
+        self.assertTrue(result.startswith("NO_DATA_AVAILABLE"))
+        self.assertEqual(de._indicator_source["0100.HK"], "AKShare")
+
+    def test_enhanced_flag_set(self):
+        fn = de._make_enhanced_indicators(MagicMock())
+        self.assertTrue(getattr(fn, "_enhanced", False))
+
+
+# ── 9. quality header reflects price/indicator source ──────────────────────────
+class TestQualityHeaderPriceSource(unittest.TestCase):
+    def setUp(self):
+        de._price_source.clear()
+        de._indicator_source.clear()
+
+    def test_header_shows_tracked_sources(self):
+        de._price_source["0100.HK"] = "AKShare"
+        de._indicator_source["0100.HK"] = "AKShare"
+        h = de._quality_header("0100.HK", "AKShare", "High")
+        self.assertIn("Price/Technical : AKShare", h)
+        self.assertIn("Indicators      : Calculated from AKShare", h)
+
+    def test_header_shows_unavailable_when_no_price_source(self):
+        de._price_source["0100.HK"] = "none"
+        h = de._quality_header("0100.HK", "AKShare", "Medium")
+        self.assertIn("Price/Technical : unavailable", h)
+
+    def test_header_defaults_to_yfinance_when_untracked(self):
+        h = de._quality_header("NVDA", "yFinance ✓", "High")
+        self.assertIn("Price/Technical : yFinance", h)
 
 
 if __name__ == "__main__":

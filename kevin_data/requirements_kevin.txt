@@ -4,6 +4,10 @@
 # AKShare — free fundamentals fallback for HK / A-share tickers
 akshare>=1.12.0
 
+# pandas-ta — local technical-indicator calculation (RSI, MACD, SMA, etc.)
+# from yFinance/AKShare/LSEG OHLCV data for HK / A-share tickers
+pandas-ta>=0.4.0
+
 # Finnhub — primary news/sentiment for HK tickers, secondary for US
 # Get a free API key at https://finnhub.io
 finnhub-python>=2.4.20
