@@ -8,7 +8,7 @@ Usage:
 """
 import os, sys, re, glob, shutil, subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 # ── Text cleaning ────────────────────────────────────────────────────────────
@@ -860,6 +860,552 @@ def extract_trader_plan(text):
     }
 
 
+# ── Investment Dashboard helpers (desk verdicts, price levels, timestamps) ──
+
+def _strip_md(s):
+    """Strip markdown bold/italic markers and surrounding whitespace."""
+    return re.sub(r'\*+', '', s or '').strip()
+
+
+def _hkt_timestamp(root):
+    """Derive a 'YYYY-MM-DD HH:MM HKT' timestamp from the report folder name
+    (TICKER_YYYYMMDD_HHMMSS). The source timestamp is the local time of the
+    machine generating the report (US Eastern); converted to Hong Kong time
+    (UTC+8) by adding 12 hours (13 during US daylight saving, treated the
+    same here for simplicity)."""
+    name = os.path.basename(os.path.normpath(str(root)))
+    m = re.search(r'(\d{8})_(\d{6})', name)
+    if m:
+        dt = datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
+    else:
+        dt = datetime.now()
+    return (dt + timedelta(hours=12)).strftime('%Y-%m-%d %H:%M HKT')
+
+
+_MONTH_MAP = {m: i for i, m in enumerate(
+    ['January', 'February', 'March', 'April', 'May', 'June',
+     'July', 'August', 'September', 'October', 'November', 'December'], start=1)}
+
+
+def _parse_long_date(s):
+    """'June 4, 2026' -> '2026-06-04'."""
+    m = re.search(r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', s or '')
+    if not m:
+        return None
+    month = _MONTH_MAP.get(m.group(1).capitalize())
+    if not month:
+        return None
+    return f'{m.group(3)}-{month:02d}-{int(m.group(2)):02d}'
+
+
+# ── Verdict normalization (BUY / HOLD / SELL across desk-specific wording) ──
+
+_VERDICT_SYNONYMS = {
+    'STRONG BUY': 'BUY', 'BUY': 'BUY', 'OVERWEIGHT': 'BUY', 'ACCUMULATE': 'BUY', 'ADD': 'BUY',
+    'HOLD': 'HOLD', 'NEUTRAL': 'HOLD', 'MARKET PERFORM': 'HOLD', 'EQUAL WEIGHT': 'HOLD',
+    'SELL': 'SELL', 'UNDERWEIGHT': 'SELL', 'STRONG SELL': 'SELL', 'REDUCE': 'SELL', 'TRIM': 'SELL',
+}
+
+
+def normalize_verdict(raw):
+    """Map a desk's free-text rating to BUY / HOLD / SELL, or None if unrecognized."""
+    if not raw:
+        return None
+    key = re.sub(r'[^A-Z ]', '', raw.upper())
+    key = re.sub(r'\s+', ' ', key).strip()
+    return _VERDICT_SYNONYMS.get(key)
+
+
+def verdict_hex(verdict):
+    """(fg_hex, bg_hex) for a normalized BUY/HOLD/SELL verdict."""
+    return _VERDICT_THEME.get(verdict, _VERDICT_THEME['HOLD'])
+
+
+# ── Latest price / exchange / sector (cover page) ────────────────────────────
+
+_PRICE_RE = re.compile(r'Current Price[^|\n]*?\$([\d,]+\.?\d*)', re.IGNORECASE)
+_PRICE_TABLE_RE = re.compile(
+    r'\|\s*\*{0,2}(?:Current\s+)?Price\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|', re.IGNORECASE)
+_PRICE_DATE_PATTERNS = [
+    re.compile(r'Last Complete Session:?\*{0,2}\s*\*{0,2}\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
+    re.compile(r'as of\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
+    re.compile(r'\*\*Date:?\*{0,2}\s*\*{0,2}\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
+]
+
+
+def extract_latest_price(market_text):
+    """Return (price_str, date_iso) from the market analyst report, or
+    (None, None) if no price data was available (e.g. data-provider gap)."""
+    if not market_text:
+        return None, None
+    m = _PRICE_RE.search(market_text)
+    price = m.group(1) if m else None
+    if not price:
+        m = _PRICE_TABLE_RE.search(market_text)
+        price = m.group(1) if m else None
+    date = None
+    for pat in _PRICE_DATE_PATTERNS:
+        dm = pat.search(market_text)
+        if dm:
+            date = _parse_long_date(dm.group(1))
+            break
+    return price, date
+
+
+def extract_exchange_sector(fundamentals_text, market_text=None):
+    """Pull Exchange / Sector / Industry from the fundamentals (preferred) or
+    market report header lines."""
+    out = {'exchange': None, 'sector': None, 'industry': None}
+    patterns = {
+        'exchange': re.compile(r'\*\*Exchange:?\*\*\s*([^\n|]+)', re.IGNORECASE),
+        'sector': re.compile(r'\*\*Sector:?\*\*\s*([^\n|]+)', re.IGNORECASE),
+        'industry': re.compile(r'\*\*Industry:?\*\*\s*([^\n|]+)', re.IGNORECASE),
+    }
+    for key, pat in patterns.items():
+        for text in (fundamentals_text, market_text):
+            if not text:
+                continue
+            m = pat.search(text)
+            if m:
+                out[key] = _strip_md(m.group(1))
+                break
+    return out
+
+
+# ── Desk verdict extractors (Portfolio Manager / Research Manager / Trader) ─
+
+_PM_VERDICT_PATTERNS = [
+    re.compile(r'\*\*Final Trading Decision:\s*([A-Za-z ]+?)\*\*', re.IGNORECASE),
+    re.compile(r'\*\*Final Trading Decision\*\*:\s*([A-Za-z ]+)', re.IGNORECASE),
+    re.compile(r'\*\*Rating\*\*:\s*([A-Za-z ]+)', re.IGNORECASE),
+    re.compile(r'\*\*Rating:\s*([A-Za-z ]+?)\*\*', re.IGNORECASE),
+    re.compile(r'\*\*Recommendation\*\*:\s*([A-Za-z ]+)', re.IGNORECASE),
+    re.compile(r'\*\*Recommendation:\s*([A-Za-z ]+?)\*\*', re.IGNORECASE),
+]
+
+
+def _first_match_word(text, patterns):
+    for pat in patterns:
+        m = pat.search(text)
+        if m:
+            return _strip_md(m.group(1))
+    return None
+
+
+def extract_pm_desk(decision_text):
+    """Portfolio Manager desk -> verdict / price target / horizon / 1-line reason."""
+    if not decision_text:
+        return None
+    raw = _first_match_word(decision_text, _PM_VERDICT_PATTERNS)
+    verdict = normalize_verdict(raw) or extract_recommendation(decision_text) or 'HOLD'
+
+    pt_m = re.search(r'\*\*Price Target\*\*:\s*\$?([\d,.]+)', decision_text)
+    price_target = pt_m.group(1) if pt_m else None
+
+    th_m = re.search(r'\*\*Time Horizon\*\*:\s*([^\n]+)', decision_text)
+    time_horizon = _strip_md(th_m.group(1)) if th_m else None
+
+    reason = ''
+    for label in ('Executive Summary', 'Rationale'):
+        rm = re.search(rf'\*\*{label}\*\*:?\s*(.*?)(?=\n\n\*\*|\Z)', decision_text, re.DOTALL)
+        if rm:
+            picked = dedupe_sentences(extract_sentences(rm.group(1)), max_n=1, prefer_numeric=True)
+            if picked:
+                reason = picked[0]
+                break
+
+    return {'verdict': verdict, 'price_target': price_target,
+            'time_horizon': time_horizon, 'reason': reason}
+
+
+def extract_rm_desk(manager_text):
+    """Research Manager desk -> verdict only."""
+    if not manager_text:
+        return None
+    m = re.search(r'\*\*Recommendation\*\*:\s*([A-Za-z ]+)', manager_text)
+    raw = _strip_md(m.group(1)) if m else None
+    verdict = normalize_verdict(raw) or extract_recommendation(manager_text) or 'HOLD'
+    return {'verdict': verdict}
+
+
+def extract_trader_desk(trader_text):
+    """Trader desk -> verdict / entry price / stop loss."""
+    if not trader_text:
+        return None
+    m = re.search(r'\*\*Action\*\*:\s*([A-Za-z ]+)', trader_text)
+    raw = _strip_md(m.group(1)) if m else None
+    verdict = normalize_verdict(raw) or extract_recommendation(trader_text) or 'HOLD'
+    entry_m = re.search(r'\*\*Entry Price\*\*:\s*\$?([\d,.]+)', trader_text)
+    stop_m = re.search(r'\*\*Stop Loss\*\*:\s*\$?([\d,.]+)', trader_text)
+    return {
+        'verdict': verdict,
+        'entry_price': entry_m.group(1) if entry_m else None,
+        'stop_loss': stop_m.group(1) if stop_m else None,
+    }
+
+
+def compute_composite(pm, rm, trader):
+    """Majority-rule composite verdict across the three desks.
+
+    Returns (composite, agree_names, disagree_names). Ties (no single
+    majority) defer to the Portfolio Manager, who has final sign-off.
+    """
+    desks = [('Portfolio Manager', pm), ('Research Manager', rm), ('Trader', trader)]
+    verdicts = [(name, d['verdict']) for name, d in desks if d and d.get('verdict')]
+    if not verdicts:
+        return 'HOLD', [], []
+    counts = {}
+    for _, v in verdicts:
+        counts[v] = counts.get(v, 0) + 1
+    best = max(counts.values())
+    leaders = [v for v, c in counts.items() if c == best]
+    if len(leaders) == 1:
+        composite = leaders[0]
+    else:
+        composite = (pm['verdict'] if pm and pm.get('verdict') else verdicts[0][1])
+    agree = [name for name, v in verdicts if v == composite]
+    disagree = [name for name, v in verdicts if v != composite]
+    return composite, agree, disagree
+
+
+def composite_rationale_bullets(pm, rm, trader, composite, agree, disagree):
+    """2-3 bullets explaining the composite call: PM's stated reason, which
+    desks agree/disagree, and the investment horizon or price target."""
+    verdict_by_desk = {'Portfolio Manager': pm, 'Research Manager': rm, 'Trader': trader}
+    out = []
+    if pm and pm.get('reason'):
+        out.append(pm['reason'])
+    if disagree:
+        dis_verdicts = sorted({verdict_by_desk[n]['verdict'] for n in disagree})
+        out.append(
+            f"{' and '.join(agree)} {'support' if len(agree) != 1 else 'supports'} {composite}, "
+            f"while {' and '.join(disagree)} {'lean' if len(disagree) != 1 else 'leans'} "
+            f"toward {' / '.join(dis_verdicts)}."
+        )
+    elif agree:
+        out.append(f"All desks ({', '.join(agree)}) align on {composite}.")
+    if pm and pm.get('time_horizon'):
+        out.append(f"Investment horizon: {pm['time_horizon']}.")
+    elif pm and pm.get('price_target'):
+        out.append(f"Portfolio Manager price target: ${pm['price_target']}.")
+    return out[:3]
+
+
+# ── Price targets & action levels table (Page 2) ─────────────────────────────
+
+_REASSESS_RE = re.compile(r'(?:thesis-?reassessment|reassess)[^.\n]*?\$\s*([\d,.]+)', re.IGNORECASE)
+
+
+def build_price_target_rows(verdict, pm, trader, current_price, manager_text=''):
+    """Build the 'Price Targets & Action Levels' table rows for the
+    composite verdict (BUY / SELL / HOLD branches)."""
+    rows = [['Level', 'Price', 'Notes']]
+    pm = pm or {}
+    trader = trader or {}
+    pt = pm.get('price_target')
+    entry = trader.get('entry_price')
+    stop = trader.get('stop_loss')
+    if not stop and manager_text:
+        m = _REASSESS_RE.search(manager_text)
+        if m:
+            stop = m.group(1)
+
+    if verdict == 'BUY':
+        if entry:
+            rows.append(['Entry', f'${entry}', 'Trader-recommended entry level'])
+        if stop:
+            rows.append(['Stop / Reassess', f'${stop}', 'Thesis-invalidation level'])
+        if pt:
+            rows.append(['Price Target', f'${pt}', 'Portfolio Manager target'])
+    elif verdict == 'SELL':
+        if current_price:
+            rows.append(['Current Price', f'${current_price}', 'Exit at or near market'])
+        if pt:
+            rows.append(['Downside Target', f'${pt}', 'Portfolio Manager target'])
+    else:
+        if current_price:
+            rows.append(['Current Price', f'${current_price}', 'No new position recommended'])
+        if pt:
+            rows.append(['Reassessment Level', f'${pt}', 'Portfolio Manager target'])
+
+    if len(rows) == 1:
+        rows.append(['--', 'N/A', 'No specific price levels provided in source reports'])
+    return rows
+
+
+def extract_change_triggers(decision_text, manager_text):
+    """2-3 'what would change the thesis' bullets from the PM/RM reports."""
+    out = []
+    for text in (decision_text, manager_text):
+        if not text or len(out) >= 3:
+            continue
+        m = re.search(
+            r'(?:Monitor for catalysts[^:\n]*:|Catalysts to Watch:?|\*\*Risk Management\*\*:?)'
+            r'\s*(.*?)(?=\n\n\*\*|\Z)', text, re.DOTALL | re.IGNORECASE)
+        if m:
+            content = re.sub(r'^[\s*]+', '', m.group(1))
+            for s in dedupe_sentences(extract_sentences(content), max_n=3, min_words=5):
+                if s not in out:
+                    out.append(s)
+    return out[:3]
+
+
+# ── Sentiment source table (Page 4) ──────────────────────────────────────────
+
+_SENT_SECTION_RE = re.compile(r'#{2,4}\s*(?:\d+\.\s*)?([^\n]+)\n((?:(?!\n#{1,4}).)*)', re.DOTALL)
+
+
+def _sentiment_status_count_tone(content, units):
+    """(status, count, tone) for one sentiment source's content block."""
+    if not content or not content.strip():
+        return 'Not covered', '0', 'N/A'
+    low = content.lower()
+    st_m = re.search(r'\*\*Status:?\*\*\s*([^\n]+)', content, re.IGNORECASE)
+    status_text = st_m.group(1).lower() if st_m else low
+    if re.search(r'no (?:news|posts|messages|data)|unavailable|httperror|not found|zero (?:news|posts)',
+                  status_text):
+        status = 'Unavailable' if re.search(r'unavailable|httperror', status_text) else 'Not found'
+    else:
+        status = 'Found'
+
+    cm = re.search(r'(\d+)\s*(?:' + '|'.join(units) + r')', content, re.IGNORECASE)
+    count = cm.group(1) if cm else '0'
+    if count == '0' and status == 'Found':
+        n_bullets = len(re.findall(r'^\s*-\s+', content, re.MULTILINE))
+        if n_bullets:
+            count = str(n_bullets)
+
+    dm = re.search(r'\*\*Direction:?\s*([^*\n]+)\*\*', content, re.IGNORECASE)
+    if dm:
+        d = dm.group(1).lower()
+        if 'bull' in d or 'positive' in d:
+            tone = 'Positive'
+        elif 'bear' in d or 'negative' in d:
+            tone = 'Negative'
+        else:
+            tone = 'Neutral'
+    elif status != 'Found':
+        tone = 'N/A'
+    elif re.search(r'bullish|positive', low):
+        tone = 'Positive'
+    elif re.search(r'bearish|negative', low):
+        tone = 'Negative'
+    else:
+        tone = 'Neutral'
+    return status, count, tone
+
+
+def extract_sentiment_table(text):
+    """Build the Page 4 5-row source table: Yahoo Finance News, StockTwits,
+    and Reddit r/WSB, r/stocks, r/investing -- regardless of whether the
+    source report uses numbered '### N. Source' + Status lines, or
+    unnumbered '#### Source' + Direction/prose."""
+    empty = ('Not covered', '0', 'N/A')
+    if not text:
+        return [
+            ['Source', 'Status', 'Count', 'Sentiment'],
+            ['Yahoo Finance News', *empty],
+            ['StockTwits', *empty],
+            ['Reddit r/WSB', *empty],
+            ['Reddit r/stocks', *empty],
+            ['Reddit r/investing', *empty],
+        ]
+
+    m = re.search(
+        r'Source-by-Source Breakdown\s*\n(.*?)'
+        r'(?=\n#{1,3}\s*(?:\d+\.\s*)?(?:Cross-Source|Dominant|Catalysts|Conclusion|Summary)|\Z)',
+        text, re.DOTALL | re.IGNORECASE)
+    block = m.group(1) if m else text
+
+    subsecs = [(sm.group(1).strip(), sm.group(2)) for sm in _SENT_SECTION_RE.finditer(block)]
+
+    def find(*keywords):
+        for name, content in subsecs:
+            ln = name.lower()
+            if any(k in ln for k in keywords):
+                return content
+        return ''
+
+    rows = [['Source', 'Status', 'Count', 'Sentiment']]
+
+    news_content = find('news', 'yahoo')
+    rows.append(['Yahoo Finance News', *_sentiment_status_count_tone(news_content, ['articles?', 'headlines?'])])
+
+    st_content = find('stocktwits')
+    rows.append(['StockTwits', *_sentiment_status_count_tone(st_content, ['messages?'])])
+
+    reddit_content = find('reddit')
+    sub_specs = [
+        (r'r/(?:wallstreetbets|wallstreetbels|wsb)[^\n(]*\((\d+)\s*posts?\)', 'Reddit r/WSB'),
+        (r'r/stocks[^\n(]*\((\d+)\s*posts?\)', 'Reddit r/stocks'),
+        (r'r/investing[^\n(]*\((\d+)\s*posts?\)', 'Reddit r/investing'),
+    ]
+    overall_status, overall_count, overall_tone = _sentiment_status_count_tone(
+        reddit_content, ['posts?', 'messages?'])
+    found_any = False
+    sub_rows = []
+    for pat, label in sub_specs:
+        sm = re.search(pat, reddit_content, re.IGNORECASE) if reddit_content else None
+        if sm:
+            found_any = True
+            seg = reddit_content[sm.start():sm.start() + 400]
+            _, _, tone = _sentiment_status_count_tone(seg, ['posts?'])
+            sub_rows.append([label, 'Found', sm.group(1), tone])
+        else:
+            sub_rows.append([label, overall_status, overall_count, overall_tone])
+    if not found_any:
+        sub_rows = [[label, overall_status, overall_count, overall_tone]
+                     for _, label in sub_specs]
+    rows.extend(sub_rows)
+    return rows
+
+
+# ── Fundamental table with Implication column (Page 4) ──────────────────────
+
+_FUND_CATEGORY_MAP = [
+    (r'p/e|p/b|peg|price.to|valuation', 'Valuation'),
+    (r'revenue growth|eps growth|revenue yoy|eps yoy|^revenue\b|growth \(yoy\)', 'Growth'),
+    (r'\broe\b|\broa\b|\broic\b|margin|net income|operating income|gross profit|profitab', 'Profitability'),
+    (r'efficien|turnover', 'Efficiency'),
+    (r'debt|leverage|liquidity|current ratio|cash|equity|book value|runway', 'Financial Health'),
+    (r'market cap|^size\b', 'Size'),
+]
+
+
+def _categorize_metric(label):
+    low = (label or '').lower()
+    for pat, cat in _FUND_CATEGORY_MAP:
+        if re.search(pat, low):
+            return cat
+    return 'Other'
+
+
+_FUND_CATEGORY_TEMPLATES = {
+    'Valuation': "{m} of {v} is a key input for judging whether the current price is justified by growth and profitability.",
+    'Growth': "{m} of {v} indicates the pace at which the business is expanding.",
+    'Profitability': "{m} of {v} reflects how efficiently the business converts revenue into profit.",
+    'Efficiency': "{m} of {v} measures how effectively the company deploys its capital base.",
+    'Financial Health': "{m} of {v} bears on the company's ability to meet obligations and fund continued growth.",
+    'Size': "{m} of {v} sets the scale against which growth and valuation multiples are judged.",
+    'Other': "{m} stands at {v}.",
+}
+
+
+def _generic_fund_implication(category, metric, value):
+    template = _FUND_CATEGORY_TEMPLATES.get(category, _FUND_CATEGORY_TEMPLATES['Other'])
+    return template.format(m=metric, v=value)
+
+
+def extract_fundamental_table(text, max_rows=15):
+    """Page 4 fundamentals table with a 4th 'Implication' column, handling
+    the 3-col (Category|Metric|Value), FY-trend (Metric|FY..|Trend), and
+    generic Metric|Value(|...|Assessment) Summary Table formats."""
+    if not text:
+        return []
+    m = re.search(r'#{1,3}[^\n]*Summary Table[^\n]*\n+((?:\|.*\n?)+)', text, re.IGNORECASE)
+    if not m:
+        return []
+    lines = [l for l in m.group(1).strip().split('\n') if l.strip().startswith('|')]
+    rows = parse_tbl(lines)
+    if len(rows) < 2:
+        return []
+    header = [_strip_md(h).lower() for h in rows[0]]
+
+    out = [['Category', 'Metric', 'Value', 'Implication']]
+
+    if 'category' in header and 'metric' in header and 'value' in header:
+        ci, mi, vi = header.index('category'), header.index('metric'), header.index('value')
+        for row in rows[1:]:
+            if len(row) <= max(ci, mi, vi):
+                continue
+            cat_raw, metric, value = row[ci], row[mi], row[vi]
+            category = _categorize_metric(cat_raw)
+            if category == 'Other':
+                category = _categorize_metric(metric)
+            out.append([cat_raw, metric, value,
+                         _generic_fund_implication(category, _strip_md(metric), _strip_md(value))])
+
+    elif 'metric' in header and ('trend' in header or any(re.match(r'fy\d{4}', h) for h in header)):
+        mi = header.index('metric')
+        fy_idx = [i for i, h in enumerate(header) if re.match(r'fy\d{4}', h)]
+        vi = fy_idx[-1] if fy_idx else (header.index('value') if 'value' in header else len(header) - 1)
+        ti = header.index('trend') if 'trend' in header else None
+        for row in rows[1:]:
+            if len(row) <= mi:
+                continue
+            metric = row[mi]
+            value = row[vi] if len(row) > vi else ''
+            implication = _strip_md(row[ti]) if ti is not None and len(row) > ti else ''
+            category = _categorize_metric(metric)
+            if not implication:
+                implication = _generic_fund_implication(category, _strip_md(metric), _strip_md(value))
+            out.append([category, metric, value, implication])
+
+    else:
+        if 'metric' in header and 'value' in header:
+            mi, vi = header.index('metric'), header.index('value')
+        else:
+            mi, vi = 0, min(1, len(header) - 1)
+        ai = None
+        for cand in ('assessment', 'implication', 'interpretation'):
+            if cand in header:
+                ai = header.index(cand)
+                break
+        for row in rows[1:]:
+            if len(row) <= max(mi, vi):
+                continue
+            metric, value = row[mi], row[vi]
+            category = _categorize_metric(metric)
+            implication = _strip_md(row[ai]) if ai is not None and len(row) > ai else ''
+            if not implication:
+                implication = _generic_fund_implication(category, _strip_md(metric), _strip_md(value))
+            out.append([category, metric, value, implication])
+
+    if len(out) > max_rows:
+        out = [out[0]] + out[1:max_rows]
+    return out
+
+
+# ── Technical table: normalize "Interpretation" -> "Implication" ───────────
+
+def ensure_technical_implication(table_rows):
+    """Some reports label the technical Summary Table's 4th column
+    'Interpretation' instead of 'Implication'; normalize for display."""
+    if not table_rows:
+        return table_rows
+    header = [_strip_md(h) for h in table_rows[0]]
+    for i, h in enumerate(header):
+        if h.lower() in ('implication', 'interpretation'):
+            header[i] = 'Implication'
+            break
+    return [header] + table_rows[1:]
+
+
+def overall_signal_from_table(table_rows):
+    """Majority Bullish/Bearish/Neutral signal across a technical table's
+    'Signal' column."""
+    if not table_rows or len(table_rows) < 2:
+        return None
+    header = [_strip_md(h).lower() for h in table_rows[0]]
+    if 'signal' not in header:
+        return None
+    si = header.index('signal')
+    counts = {'Bullish': 0, 'Bearish': 0}
+    for row in table_rows[1:]:
+        if len(row) <= si:
+            continue
+        cell = _strip_md(row[si]).lower()
+        if 'bullish' in cell:
+            counts['Bullish'] += 1
+        elif 'bearish' in cell:
+            counts['Bearish'] += 1
+    if counts['Bullish'] > counts['Bearish']:
+        return 'Bullish'
+    if counts['Bearish'] > counts['Bullish']:
+        return 'Bearish'
+    return 'Neutral'
+
+
 # ── Shared rendering helpers (used by both PDF builders) ─────────────────────
 
 def _check_reportlab():
@@ -912,10 +1458,7 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     MGRAY = colors.HexColor('#CED4DA')
     DGRAY = colors.HexColor('#343A40')
 
-    VERDICT_COLORS = {
-        rec: (colors.HexColor(fg), colors.HexColor(bg))
-        for rec, (fg, bg) in _VERDICT_THEME.items()
-    }
+    footer_ts = _hkt_timestamp(root)
 
     def draw_footer(canvas, doc):
         canvas.saveState()
@@ -926,7 +1469,7 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         canvas.setFont('Helvetica', 7.5)
         canvas.setFillColor(GRAY)
         canvas.drawString(0.75*inch, 0.45*inch,
-                          f'{ticker}  |  {date}  |  Kevin Cheng Investment Research')
+                          f'{ticker}  |  {footer_ts}  |  Kevin Cheng Investment Research')
         canvas.drawRightString(w - 0.75*inch, 0.45*inch, f'Page {doc.page}')
         canvas.restoreState()
 
@@ -988,6 +1531,43 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         return [Paragraph(title, sec_h),
                 HRFlowable(width='100%', thickness=1.5, color=NAVY, spaceAfter=10)]
 
+    def verdict_chip(label, vd, width=1.7*inch, display=None):
+        fg_hex, bg_hex = verdict_hex(vd)
+        text = display if display is not None else vd
+        chip_st = ps('d_chip', fontSize=12, fontName='Helvetica-Bold',
+                      textColor=colors.HexColor(fg_hex), leading=15, alignment=TA_CENTER)
+        t = Table([[Paragraph(f'{label}: <b>{text}</b>', chip_st)]], colWidths=[width])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0),(-1,-1), colors.HexColor(bg_hex)),
+            ('BOX', (0,0),(-1,-1), 0.5, colors.HexColor(fg_hex)),
+            ('TOPPADDING', (0,0),(-1,-1), 6),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 6),
+        ]))
+        return t
+
+    def desk_verdict_table(pm_v, rm_v, trader_v, composite_v):
+        headers = ['Portfolio Manager', 'Research Manager', 'Trader', 'Composite']
+        verdicts = [pm_v, rm_v, trader_v, composite_v]
+        header_row = [Paragraph(h, tbl_h) for h in headers]
+        cell_row = []
+        style = [
+            ('BACKGROUND', (0,0),(-1,0), DGRAY),
+            ('GRID', (0,0),(-1,-1), 0.4, MGRAY),
+            ('TOPPADDING', (0,0),(-1,-1), 6),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 6),
+            ('VALIGN', (0,0),(-1,-1), 'MIDDLE'),
+            ('LINEABOVE', (3,1),(3,1), 1.5, NAVY),
+        ]
+        for i, vd in enumerate(verdicts):
+            fg_hex, bg_hex = verdict_hex(vd)
+            cell_st = ps(f'd_dvc{i}', fontSize=12, fontName='Helvetica-Bold',
+                         textColor=colors.HexColor(fg_hex), leading=15, alignment=TA_CENTER)
+            cell_row.append(Paragraph(vd, cell_st))
+            style.append(('BACKGROUND', (i,1),(i,1), colors.HexColor(bg_hex)))
+        t = Table([header_row, cell_row], colWidths=[1.75*inch]*4)
+        t.setStyle(TableStyle(style))
+        return t
+
     # ── Extract distilled content from each section ──────────────────────────
     company_name = extract_company_name(sections['fundamentals'])
     data_src = (extract_data_sources_header(sections['market'])
@@ -1017,6 +1597,19 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     news = extract_news_summary(sections['news']) if sections['news'] else None
     trader = extract_trader_plan(sections['trader']) if sections['trader'] else None
 
+    # ── Investment Dashboard data: latest price, exchange/sector, desks ──────
+    latest_price, price_date = extract_latest_price(sections['market'])
+    exch_sector = extract_exchange_sector(sections['fundamentals'], sections['market'])
+    pm_desk = extract_pm_desk(sections['decision'])
+    rm_desk = extract_rm_desk(sections['manager'])
+    trader_desk = extract_trader_desk(sections['trader'])
+    composite, agree_desks, disagree_desks = compute_composite(pm_desk, rm_desk, trader_desk)
+    price_target_rows = build_price_target_rows(
+        composite, pm_desk, trader_desk, latest_price, sections['manager'])
+    rationale_bullets = composite_rationale_bullets(
+        pm_desk, rm_desk, trader_desk, composite, agree_desks, disagree_desks)
+    change_triggers = extract_change_triggers(sections['decision'], sections['manager'])
+
     # ── PAGE 1: Cover ──────────────────────────────────────────────────────
     story = [
         Spacer(1, 1.3*inch), bar(NAVY, 3), Spacer(1, 0.25*inch),
@@ -1033,9 +1626,24 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
                   ps('d_cn', fontSize=14, textColor=DGRAY, leading=18, alignment=TA_CENTER)))
     story += [
         Spacer(1, 0.1*inch), bar(GOLD, 2), Spacer(1, 0.25*inch),
-        Paragraph(f'Analysis Date: {date}',
+        Paragraph(f'Analysis Date: {date}  |  Report Generated: {footer_ts}',
                   ps('d_cd', fontSize=13, textColor=GRAY, leading=17, alignment=TA_CENTER)),
-        Spacer(1, 1.0*inch),
+    ]
+    if latest_price:
+        price_line = f'Latest Price: ${latest_price}'
+        if price_date:
+            price_line += f' (as of {price_date})'
+    else:
+        price_line = 'Latest Price: N/A -- see Technical Analysis section'
+    story.append(Paragraph(esc(price_line),
+              ps('d_cpx', fontSize=12, fontName='Helvetica-Bold',
+                 textColor=NAVY, leading=16, alignment=TA_CENTER)))
+    exch_bits = [v for v in (exch_sector['exchange'], exch_sector['sector'], exch_sector['industry']) if v]
+    if exch_bits:
+        story.append(Paragraph(esc(' | '.join(exch_bits)),
+                  ps('d_cex', fontSize=10, textColor=GRAY, leading=13, alignment=TA_CENTER)))
+    story += [
+        Spacer(1, 0.85*inch),
         Paragraph('Prepared for: Kevin Cheng',
                   ps('d_cp', fontSize=12, textColor=GRAY, leading=15, alignment=TA_CENTER)),
         Spacer(1, 0.08*inch),
@@ -1054,25 +1662,22 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
                   ps('d_ds', fontSize=8.5, textColor=GRAY, leading=12, alignment=TA_CENTER)))
     story.append(PageBreak())
 
-    # ── PAGE 2: Investment Verdict ────────────────────────────────────────
-    rec = verdict['recommendation']
-    rec_fg, rec_bg = VERDICT_COLORS.get(rec, VERDICT_COLORS['HOLD'])
+    # ── PAGE 2: Investment Dashboard ──────────────────────────────────────
+    story += section_header('Investment Dashboard')
 
-    story += section_header('Investment Verdict')
+    story.append(Paragraph('Desk Verdicts', h2s))
+    story += [desk_verdict_table(pm_desk['verdict'] if pm_desk else 'HOLD',
+                                  rm_desk['verdict'] if rm_desk else 'HOLD',
+                                  trader_desk['verdict'] if trader_desk else 'HOLD',
+                                  composite),
+              Spacer(1, 10)]
 
-    rec_st = ps('d_rec', fontSize=28, fontName='Helvetica-Bold',
-                textColor=colors.white, leading=34, alignment=TA_CENTER)
-    rec_tbl = Table([[Paragraph(rec, rec_st)]], colWidths=[7.0*inch])
-    rec_tbl.setStyle(TableStyle([
-        ('BACKGROUND', (0,0),(-1,-1), rec_fg),
-        ('TOPPADDING', (0,0),(-1,-1), 14),
-        ('BOTTOMPADDING', (0,0),(-1,-1), 14),
-    ]))
-    story += [rec_tbl, Spacer(1, 12)]
+    if rationale_bullets:
+        story.append(Paragraph('Composite Rationale', h2s))
+        story += bullets(rationale_bullets)
 
-    if verdict['rationale']:
-        story.append(Paragraph('Rationale', h2s))
-        story.append(Paragraph(md2rl(' '.join(verdict['rationale'])), body))
+    story.append(Paragraph('Price Targets & Action Levels', h2s))
+    story += rl_table(price_target_rows, col_widths=[1.8*inch, 1.2*inch, 4.0*inch])
 
     if verdict['actions']:
         story.append(Paragraph('Strategic Actions', h2s))
@@ -1110,7 +1715,8 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
 
     if mgr_summary:
         story.append(Paragraph('Research Manager Summary', h2s))
-        story.append(Paragraph(f"Decision: <b>{mgr_summary['recommendation']}</b>", body))
+        rm_v = rm_desk['verdict'] if rm_desk else 'HOLD'
+        story += [verdict_chip('Research Manager', rm_v, width=2.5*inch), Spacer(1, 6)]
         if mgr_summary['intro']:
             story.append(Paragraph(md2rl(' '.join(mgr_summary['intro'])), body))
         if mgr_summary['swing']:
@@ -1122,14 +1728,21 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     # ── PAGE 4: Analyst Reports Summary ───────────────────────────────────
     story += section_header('Analyst Reports Summary')
 
+    _SIGNAL_TO_VERDICT = {'Bullish': 'BUY', 'Bearish': 'SELL', 'Neutral': 'HOLD'}
+
     story.append(Paragraph('Technical Analysis', h2s))
     if tech and tech['available']:
         if tech['intro']:
             story.append(Paragraph(md2rl(' '.join(tech['intro'])), body))
         if tech['table']:
-            story += rl_table(tech['table'])
+            story += rl_table(ensure_technical_implication(tech['table']))
+            overall_tech = overall_signal_from_table(tech['table'])
+            if overall_tech:
+                story += [verdict_chip('Technical Signal', _SIGNAL_TO_VERDICT[overall_tech],
+                                        width=3.0*inch, display=overall_tech),
+                          Spacer(1, 6)]
         if tech['recommendation']:
-            story.append(Paragraph(f"Technical Signal: <b>{tech['recommendation']}</b>", body))
+            story.append(Paragraph(f"Technical Signal (Analyst): <b>{tech['recommendation']}</b>", body))
     elif tech:
         story.append(Paragraph(
             'Price/technical data was unavailable for this ticker from the data provider.', small))
@@ -1142,7 +1755,11 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     if fund:
         if fund['market_cap']:
             story.append(Paragraph(f"Market Capitalization: <b>{esc(fund['market_cap'])}</b>", body))
-        if fund['table']:
+        fund_table = extract_fundamental_table(sections['fundamentals'])
+        if fund_table:
+            story += rl_table(fund_table,
+                               col_widths=[1.3*inch, 1.6*inch, 1.3*inch, 2.8*inch])
+        elif fund['table']:
             story += rl_table(fund['table'])
         if fund['insights']:
             story.append(Paragraph('Key Insights', h3s))
@@ -1158,9 +1775,9 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
             story.append(Paragraph(
                 f"Overall Sentiment: <b>{esc(sent['label'])}</b> "
                 f"(Score: {esc(sent['score'])}) | Confidence: {esc(sent['confidence'])}", body))
-        if sent['sources']:
-            rows = [['Source', 'Status']] + [[s[0], s[1]] for s in sent['sources']]
-            story += rl_table(rows, col_widths=[2.3*inch, 4.7*inch])
+        sent_table = extract_sentiment_table(sections['sentiment'])
+        if sent_table:
+            story += rl_table(sent_table, col_widths=[2.0*inch, 1.3*inch, 1.0*inch, 2.7*inch])
         if sent['themes']:
             story.append(Paragraph('Dominant Themes', h3s))
             story += bullets(sent['themes'])
@@ -1201,17 +1818,28 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     if trader and (trader['action'] or trader['reasoning'] or trader['sizing']):
         story.append(PageBreak())
         story += section_header("Trader's Action Plan")
+        trader_v = trader_desk['verdict'] if trader_desk else 'HOLD'
+        story += [verdict_chip('Trader Action', trader_v, width=2.5*inch), Spacer(1, 6)]
         if trader['action']:
             story.append(Paragraph(f"Action: <b>{esc(trader['action'])}</b>", body))
+        if pm_desk and pm_desk.get('time_horizon'):
+            story.append(Paragraph(f"Investment Horizon: <b>{esc(pm_desk['time_horizon'])}</b>", body))
         if trader['reasoning']:
             story.append(Paragraph('Reasoning', h3s))
             story.append(Paragraph(md2rl(' '.join(trader['reasoning'])), body))
         if trader['sizing']:
             story.append(Paragraph('Position Sizing', h3s))
             story.append(Paragraph(md2rl(trader['sizing']), body))
+        if change_triggers:
+            story.append(Paragraph('Reassessment Triggers', h3s))
+            story += bullets(change_triggers)
         if trader['final']:
             story.append(Spacer(1, 8))
             story.append(Paragraph(f"FINAL TRANSACTION PROPOSAL: <b>{trader['final']}</b>", h2s))
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(
+            'See Investment Dashboard (page 2) for price targets, stop-loss levels, '
+            'and the composite desk verdict.', small))
 
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=letter,
