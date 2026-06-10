@@ -43,6 +43,24 @@ _INDICATOR_HISTORY_BUFFER_DAYS = 400
 _OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
 _lseg_calls = 0
+_lseg_connection_failed = False
+
+
+def mark_lseg_connection_failed() -> None:
+    """Record that an LSEG call was attempted (EDP_API_KEY set) but failed."""
+    global _lseg_connection_failed
+    _lseg_connection_failed = True
+
+
+def lseg_connection_failed() -> bool:
+    """True if an LSEG call was attempted this run but failed/raised."""
+    return _lseg_connection_failed
+
+
+def reset_lseg_connection_state() -> None:
+    """Test helper: clear the connection-failure flag between runs."""
+    global _lseg_connection_failed
+    _lseg_connection_failed = False
 
 
 # ── ticker helpers (kept local to avoid a circular import with
@@ -165,6 +183,8 @@ def fetch_ohlcv_lseg(ticker: str, start_date: str, end_date: str) -> Optional[pd
     try:
         import lseg.data as ld  # noqa: F401
     except ImportError:
+        logging.warning("LSEG price fallback skipped for %s: lseg-data package not installed", ticker)
+        mark_lseg_connection_failed()
         return None
 
     def _work():
@@ -172,7 +192,8 @@ def fetch_ohlcv_lseg(ticker: str, start_date: str, end_date: str) -> Optional[pd
         try:
             return ld.get_history(
                 universe=ticker,
-                fields=["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"],
+                fields=["OPEN_PRC", "HIGH_1", "LOW_1", "ALT_CLOSE", "ACVOL_UNS"],
+                interval="daily",
                 start=start_date, end=end_date,
             )
         finally:
@@ -184,22 +205,31 @@ def fetch_ohlcv_lseg(ticker: str, start_date: str, end_date: str) -> Optional[pd
             df = ex.submit(_work).result(timeout=_LSEG_TIMEOUT)
     except FuturesTimeout:
         logging.warning("LSEG price fetch timed out for %s", ticker)
+        mark_lseg_connection_failed()
         return None
     except Exception as exc:
         logging.warning("LSEG price fetch failed for %s: %s", ticker, exc)
+        mark_lseg_connection_failed()
         return None
 
     _lseg_calls += 1
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     if df is None or df.empty:
-        _append_log(f"{ts} | LSEG-PRICE | {ticker} | no data | {_lseg_calls} calls")
+        _append_log(f"{ts} | LSEG_PRICE | {ticker} | days_fetched:0 | calls:{_lseg_calls}")
         return None
 
-    # Normalize column names (e.g. "OPEN"/"Open Price" -> "Open")
+    # Normalize LSEG field codes (e.g. "OPEN_PRC", "ACVOL_UNS") to OHLCV names
+    _LSEG_FIELD_MAP = {
+        "OPEN_PRC": "Open", "HIGH_1": "High", "LOW_1": "Low",
+        "ALT_CLOSE": "Close", "TRDPRC_1": "Close", "ACVOL_UNS": "Volume",
+    }
     rename_map = {}
     for col in df.columns:
         cu = str(col).upper()
+        if cu in _LSEG_FIELD_MAP:
+            rename_map[col] = _LSEG_FIELD_MAP[cu]
+            continue
         for canon in _OHLCV_COLS:
             if canon.upper() in cu:
                 rename_map[col] = canon
@@ -207,12 +237,12 @@ def fetch_ohlcv_lseg(ticker: str, start_date: str, end_date: str) -> Optional[pd
     df = df.rename(columns=rename_map)
     have = [c for c in _OHLCV_COLS if c in df.columns]
     if not have:
-        _append_log(f"{ts} | LSEG-PRICE | {ticker} | unrecognized columns | {_lseg_calls} calls")
+        _append_log(f"{ts} | LSEG_PRICE | {ticker} | days_fetched:0 | calls:{_lseg_calls}")
         return None
 
     df.index = pd.to_datetime(df.index)
     df.index.name = "Date"
-    _append_log(f"{ts} | LSEG-PRICE | {ticker} | {','.join(have)} | {_lseg_calls} calls")
+    _append_log(f"{ts} | LSEG_PRICE | {ticker} | days_fetched:{len(df)} | calls:{_lseg_calls}")
     return df[have]
 
 

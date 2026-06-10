@@ -358,6 +358,60 @@ _HEADING_LINE = re.compile(r'^#{1,4}\s*.*$', re.MULTILINE)
 _HR_LINE = re.compile(r'^\s*([-*_])(?:\s*\1){2,}\s*$', re.MULTILINE)
 
 
+# ── Professional-tone normalization (FIX2) ──────────────────────────────────
+# First-person/theatrical framings to strip wholesale. Any sentence
+# containing one of these (case-insensitive) is dropped entirely, since
+# these phrases mark debate/rhetoric rather than analytical content.
+_THEATRICAL_PHRASES = [
+    "i think", "i believe", "let me", "i appreciate", "i find", "i must",
+    "i have to say", "i get it", "make no mistake", "let's be",
+    "the fact is", "what we have here", "pull back the curtain",
+    "rearview mirror", "road ahead", "house of cards", "beautiful story",
+    "war chest", "rocket ship", "textbook", "cut through the noise",
+    "my opponent says", "as i argued", "you said",
+    "looks scary on a spreadsheet", "dismantle your argument",
+    "i recommend", "i've", "i'm ", "after an exhaustive debate",
+    "my decision", "my view", "my analysis", "my recommendation",
+    "my conviction", "the three critical points",
+    "oh, by the way", "by the way", "i acknowledge", "to be fair",
+    "honestly,", "frankly,", "i'd", "i would", "i'll", "i will",
+    "in my opinion", "to be clear",
+]
+_THEATRICAL_RE = re.compile(
+    '|'.join(re.escape(p) for p in _THEATRICAL_PHRASES), re.IGNORECASE)
+
+# Debate-framing references ("you/your", "my opponent", "the bull/bear case")
+# stripped from research/risk-team bullets so each side's memo reads as a
+# standalone analysis with no reference to the other side.
+_DEBATE_REF_RE = re.compile(
+    r"\b(?:you|your|you're|yours?|the other side|the bull case|the bear case)\b",
+    re.IGNORECASE)
+
+
+def _drop_debate_refs(sentences):
+    """Remove sentences that reference the opposing analyst/side."""
+    return [s for s in sentences if not _DEBATE_REF_RE.search(s)]
+
+# Leading conjunctions/hedges to strip from sentence starts (rule: "no
+# conjunctions like but/however/yet at sentence start").
+_LEADING_CONJ_RE = re.compile(
+    r'^(?:But|However|Yet|And|So|Nevertheless|Nonetheless|Moreover|Although|Though|Still),?\s+',
+    re.IGNORECASE)
+
+# Leading "1. " / "2) " numbered-list markers left over after collapsing a
+# markdown list item to a single sentence.
+_LEADING_NUM_RE = re.compile(r'^\d+[\.\)]\s*')
+
+
+def _polish_sentence(s):
+    """Strip leading conjunctions/hedges/list-numbers and re-capitalize."""
+    s = _LEADING_NUM_RE.sub('', s)
+    s = _LEADING_CONJ_RE.sub('', s)
+    if s:
+        s = s[0].upper() + s[1:]
+    return s
+
+
 def extract_sentences(text):
     """Collapse a markdown blob to plain text and split into sentences."""
     text = _HEADING_LINE.sub('', text or '')
@@ -371,8 +425,11 @@ def extract_sentences(text):
     out = []
     for s in sents:
         s = s.strip().strip('"“”')
-        if s:
-            out.append(s)
+        if not s or s.endswith('?'):  # drop empties and rhetorical questions
+            continue
+        if _THEATRICAL_RE.search(s):  # drop first-person/theatrical sentences
+            continue
+        out.append(_polish_sentence(s))
     return out
 
 
@@ -380,15 +437,24 @@ def _word_set(s):
     return set(re.findall(r'[a-z0-9]+', s.lower()))
 
 
-def dedupe_sentences(sentences, max_n=6, min_words=4, prefer_numeric=False):
+def dedupe_sentences(sentences, max_n=6, min_words=4, prefer_numeric=False,
+                      require_numeric=False):
     """Keep the first occurrence of each roughly-distinct claim.
 
     With prefer_numeric=True, sentences containing a number/%/$ (the
     factual data points the distillation rules say to keep) are
     considered before purely qualitative ones.
+
+    With require_numeric=True, sentences without a number/%/$ are dropped
+    outright (each bullet must state a specific metric), unless that would
+    leave nothing to choose from.
     """
     candidates = [s for s in sentences if len(_word_set(s)) >= min_words]
-    if prefer_numeric:
+    if require_numeric:
+        numeric = [s for s in candidates if re.search(r'[\d$%]', s)]
+        if numeric:
+            candidates = numeric
+    elif prefer_numeric:
         numeric = [s for s in candidates if re.search(r'[\d$%]', s)]
         other = [s for s in candidates if not re.search(r'[\d$%]', s)]
         candidates = numeric + other
@@ -483,9 +549,14 @@ def extract_verdict(text):
         recommendation = 'HOLD'
 
     rat_m = re.search(
-        r'\*\*Rationale\*\*:?\s*(.*?)(?=\n\n\*{0,2}\d+\.|\n\n\*\*Strategic|\Z)',
+        r'\*\*Rationale\*\*:?\s*(.*?)(?=\n\n\*\*Strategic|\Z)',
         text, re.DOTALL)
-    rationale = extract_sentences(rat_m.group(1))[:3] if rat_m else []
+    rationale = []
+    if rat_m:
+        rat_sents = extract_sentences(rat_m.group(1))
+        rationale = dedupe_sentences(rat_sents, max_n=3, require_numeric=True)
+        if not rationale:
+            rationale = dedupe_sentences(rat_sents, max_n=2)
 
     actions = []
     sa_m = re.search(
@@ -501,26 +572,52 @@ def extract_verdict(text):
 
 
 def extract_risk_view(text, max_n=4):
-    """Conservative / Aggressive / Neutral risk-team round-1 view -> bullets."""
+    """Conservative / Aggressive / Neutral risk-team round-1 view -> bullets.
+
+    Each bullet must state a specific number/metric (rule: "must contain at
+    least one specific number/metric"); backfilled with qualitative
+    sentences only if too few numeric ones are available.
+    """
     if not text:
         return []
     sentences = extract_sentences(first_round(text))
-    return dedupe_sentences(sentences, max_n, min_words=7, prefer_numeric=True)
+    clean = _drop_debate_refs(sentences)
+    pool = clean if clean else sentences
+    out = dedupe_sentences(pool, max_n, min_words=7, require_numeric=True)
+    if len(out) < max_n:
+        for s in dedupe_sentences(pool, max_n, min_words=7):
+            if s not in out:
+                out.append(s)
+            if len(out) >= max_n:
+                break
+    return out
 
 
 def extract_research_view(text, label):
-    """Bull / Bear researcher round-1 -> thesis sentences + supporting args."""
+    """Bull / Bear researcher round-1 -> 4-6 memo-style bullet points.
+
+    Each bullet is a single, complete, third-person sentence stating a
+    specific number/metric and what it means for the thesis -- no debate
+    framing, no reference to the other side.
+    """
     round1 = first_round(text)
     quotes = agent_quotes(round1, label)
     sentences = extract_sentences(quotes)
     substantive = [s for s in sentences if len(_word_set(s)) >= 7]
     pool = substantive if substantive else sentences
-    thesis = dedupe_sentences(pool[:6], 2, min_words=0)
-    remaining = [s for s in pool if s not in thesis]
-    args = dedupe_sentences(remaining, 4, min_words=7, prefer_numeric=True)
+    clean = _drop_debate_refs(pool)
+    pool = clean if clean else pool
+
+    bullets = dedupe_sentences(pool, 6, min_words=7, require_numeric=True)
+    if len(bullets) < 4:
+        for s in dedupe_sentences(pool, 6, min_words=7):
+            if s not in bullets:
+                bullets.append(s)
+            if len(bullets) >= 4:
+                break
+
     return {
-        'thesis': thesis,
-        'args': args,
+        'bullets': bullets[:6],
         'final': extract_recommendation(text),
     }
 
@@ -598,6 +695,72 @@ def extract_fundamentals_summary(text):
     }
 
 
+# ── Risk table: "| Risk Factor | Severity | Evidence | Significance |" ──────
+# Templated significance rationale, keyed by keywords found in the risk
+# factor name or evidence cell. Falls back to a severity-based statement.
+_RISK_SIGNIFICANCE_RULES = [
+    (r'negative equity|stockholders.? deficit',
+     "Liabilities exceed assets, raising solvency concerns absent further capital raises."),
+    (r'cash flow',
+     "Operations consume cash, requiring external financing until the business reaches breakeven."),
+    (r'equity funding|dilution|stock issuance|share issuance',
+     "Reliance on share issuance to fund operations dilutes existing shareholders."),
+    (r'operating loss',
+     "Core business is not yet self-sustaining; the trend in this figure is central to the thesis."),
+    (r'earnings volatility|investment|securities',
+     "Non-operating items can obscure the underlying trajectory of the core business."),
+    (r'cash runway|runway',
+     "Bounds the timeline before additional financing or breakeven is required."),
+    (r'liquidity|current ratio',
+     "A ratio below 1.0 signals potential difficulty meeting near-term obligations."),
+    (r'leverage|debt',
+     "Elevated leverage increases sensitivity to financing-cost or refinancing shocks."),
+    (r'concentration',
+     "Loss of a key customer or supplier could disproportionately affect revenue."),
+    (r'valuation',
+     "Elevated multiples leave limited room for error if growth decelerates."),
+    (r'competition|competitive',
+     "Increased competitive pressure could compress margins or market share."),
+    (r'regulatory|regulation',
+     "Adverse regulatory action could impose costs or restrict operations."),
+]
+
+
+def _risk_significance(factor, severity, evidence):
+    """Return a one-sentence rationale for why this risk matters."""
+    haystack = f'{factor} {evidence}'.lower()
+    for pattern, sig in _RISK_SIGNIFICANCE_RULES:
+        if re.search(pattern, haystack):
+            return sig
+    sev = severity.lower()
+    if 'high' in sev:
+        return "High-severity factor with direct bearing on near-term valuation and solvency."
+    if 'medium' in sev:
+        return "Moderate factor that warrants monitoring but is not yet thesis-changing."
+    return "Lower-severity factor unlikely to be thesis-changing on its own."
+
+
+def extract_key_risks_table(text):
+    """Pull the fundamentals report's '## Key Risks' table
+    (Risk Factor | Severity | Details) and append a Significance column."""
+    if not text:
+        return []
+    m = re.search(r'#{1,3}[^\n]*Key Risks?[^\n]*\n+((?:\|.*\n?)+)', text, re.IGNORECASE)
+    if not m:
+        return []
+    lines = [l for l in m.group(1).strip().split('\n') if l.strip().startswith('|')]
+    rows = parse_tbl(lines)
+    if len(rows) < 2:
+        return []
+
+    out = [['Risk Factor', 'Severity', 'Evidence', 'Significance']]
+    for row in rows[1:]:
+        factor, severity, evidence = (row + ['', '', ''])[:3]
+        out.append([factor, severity, evidence,
+                     _risk_significance(factor, severity, evidence)])
+    return out
+
+
 def extract_sentiment_summary(text):
     """Sentiment analyst report -> score / sources / themes / catalysts."""
     m = re.search(
@@ -642,6 +805,8 @@ def extract_news_summary(text):
         if int(m.group(1)) > 4:
             continue
         title = re.sub(r'\*+', '', m.group(2)).strip()
+        if re.search(r'key risks?\s*&?\s*opportunit', title, re.IGNORECASE):
+            continue  # surfaced separately via the risks/opportunities table below
         sents = extract_sentences(m.group(3))
         if sents:
             themes.append((title, sents[0]))
@@ -653,8 +818,8 @@ def extract_news_summary(text):
     if m:
         lines = [l for l in m.group(1).strip().split('\n') if l.strip().startswith('|')]
         table_rows = parse_tbl(lines)
-        if len(table_rows) > 9:
-            table_rows = [table_rows[0]] + table_rows[1:9]
+        if len(table_rows) > 6:
+            table_rows = [table_rows[0]] + table_rows[1:6]
 
     risks, opps = [], []
     rm = re.search(
@@ -840,6 +1005,7 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     cons_risks = extract_risk_view(sections['conservative'], 3)
     aggr_risks = extract_risk_view(sections['aggressive'], 3)
     neut_risks = extract_risk_view(sections['neutral'], 2)
+    key_risks_table = extract_key_risks_table(sections['fundamentals'])
 
     bull_view = extract_research_view(sections['bull'], 'Bull') if sections['bull'] else None
     bear_view = extract_research_view(sections['bear'], 'Bear') if sections['bear'] else None
@@ -913,7 +1079,10 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         story += bullets(verdict['actions'])
 
     story.append(Spacer(1, 8))
-    story.append(Paragraph('Key Risks (Risk Management Team)', h2s))
+    story.append(Paragraph('Key Risks', h2s))
+    if key_risks_table:
+        story += rl_table(key_risks_table,
+                           col_widths=[1.5*inch, 0.8*inch, 2.6*inch, 2.1*inch])
     if cons_risks:
         story.append(Paragraph('Conservative View', h3s))
         story += bullets(cons_risks)
@@ -931,19 +1100,13 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
 
     if bull_view:
         story.append(Paragraph('Bull Case', h2s))
-        if bull_view['thesis']:
-            story.append(Paragraph(md2rl(' '.join(bull_view['thesis'])), body))
-        if bull_view['args']:
-            story.append(Paragraph('Supporting Arguments', h3s))
-            story += bullets(bull_view['args'])
+        if bull_view['bullets']:
+            story += bullets(bull_view['bullets'])
 
     if bear_view:
         story.append(Paragraph('Bear Case', h2s))
-        if bear_view['thesis']:
-            story.append(Paragraph(md2rl(' '.join(bear_view['thesis'])), body))
-        if bear_view['args']:
-            story.append(Paragraph('Supporting Arguments', h3s))
-            story += bullets(bear_view['args'])
+        if bear_view['bullets']:
+            story += bullets(bear_view['bullets'])
 
     if mgr_summary:
         story.append(Paragraph('Research Manager Summary', h2s))

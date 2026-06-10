@@ -365,5 +365,137 @@ class TestQualityHeaderPriceSource(unittest.TestCase):
         self.assertIn("Price/Technical : yFinance", h)
 
 
+# ── 10. LSEG connection-failure tracking ────────────────────────────────────────
+class TestLsegConnectionState(unittest.TestCase):
+    def setUp(self):
+        de._pi.reset_lseg_connection_state()
+        de._price_source.clear()
+        de._indicator_source.clear()
+
+    def tearDown(self):
+        de._pi.reset_lseg_connection_state()
+        de._price_source.clear()
+        de._indicator_source.clear()
+
+    def test_initially_not_failed(self):
+        self.assertFalse(de._pi.lseg_connection_failed())
+
+    def test_mark_sets_failed(self):
+        de._pi.mark_lseg_connection_failed()
+        self.assertTrue(de._pi.lseg_connection_failed())
+
+    def test_reset_clears_failed(self):
+        de._pi.mark_lseg_connection_failed()
+        de._pi.reset_lseg_connection_state()
+        self.assertFalse(de._pi.lseg_connection_failed())
+
+    def test_quality_header_no_warning_by_default(self):
+        h = de._quality_header("NVDA", "yFinance ✓", "High")
+        self.assertNotIn("LSEG connection failed", h)
+
+    def test_quality_header_shows_warning_when_lseg_failed(self):
+        de._pi.mark_lseg_connection_failed()
+        h = de._quality_header("0100.HK", "AKShare ✓", "Medium")
+        self.assertIn("⚠ LSEG connection failed — check EDP_API_KEY or network connectivity", h)
+
+
+# ── 11. _price_tech_label ────────────────────────────────────────────────────────
+class TestPriceTechLabel(unittest.TestCase):
+    def setUp(self):
+        de._price_source.clear()
+        de._indicator_source.clear()
+
+    def test_yfinance_label(self):
+        de._price_source["0100.HK"] = "yFinance"
+        de._indicator_source["0100.HK"] = "yFinance"
+        self.assertEqual(de._price_tech_label("0100.HK"), "yFinance ✓")
+
+    def test_akshare_label(self):
+        de._price_source["0100.HK"] = "AKShare"
+        de._indicator_source["0100.HK"] = "AKShare"
+        self.assertEqual(de._price_tech_label("0100.HK"), "AKShare ✓")
+
+    def test_lseg_price_source_label(self):
+        de._price_source["0100.HK"] = "LSEG"
+        de._indicator_source["0100.HK"] = "LSEG"
+        self.assertEqual(de._price_tech_label("0100.HK"), "LSEG+pandas-ta ✓")
+
+    def test_lseg_indicator_only_label(self):
+        de._price_source["0100.HK"] = "AKShare"
+        de._indicator_source["0100.HK"] = "LSEG"
+        self.assertEqual(de._price_tech_label("0100.HK"), "LSEG+pandas-ta ✓")
+
+    def test_unavailable_label(self):
+        de._price_source["0100.HK"] = "none"
+        self.assertEqual(de._price_tech_label("0100.HK"), "unavailable")
+
+    def test_default_label_when_untracked(self):
+        self.assertEqual(de._price_tech_label("NVDA"), "yFinance ✓")
+
+
+# ── 12. fetch_ohlcv_lseg ─────────────────────────────────────────────────────────
+class TestFetchOhlcvLseg(unittest.TestCase):
+    def setUp(self):
+        de._pi._lseg_calls = 0
+        de._pi.reset_lseg_connection_state()
+        if de._pi._USAGE_LOG.exists():
+            self._log_before = de._pi._USAGE_LOG.read_text(encoding="utf-8")
+        else:
+            self._log_before = None
+
+    def tearDown(self):
+        de._pi._lseg_calls = 0
+        de._pi.reset_lseg_connection_state()
+        if self._log_before is None:
+            de._pi._USAGE_LOG.unlink(missing_ok=True)
+        else:
+            de._pi._USAGE_LOG.write_text(self._log_before, encoding="utf-8")
+
+    def test_skipped_for_non_asia_ticker(self):
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake"}):
+            result = de._pi.fetch_ohlcv_lseg("NVDA", "2026-01-01", "2026-06-09")
+        self.assertIsNone(result)
+
+    def test_skipped_without_edp_key(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EDP_API_KEY", None)
+            result = de._pi.fetch_ohlcv_lseg("0100.HK", "2026-01-01", "2026-06-09")
+        self.assertIsNone(result)
+
+    def test_hard_cap_blocks_at_10(self):
+        de._pi._lseg_calls = 10
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake"}):
+            result = de._pi.fetch_ohlcv_lseg("0100.HK", "2026-01-01", "2026-06-09")
+        self.assertIsNone(result)
+        self.assertFalse(de._pi.lseg_connection_failed())
+
+    def test_no_data_logs_days_fetched_zero(self):
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake"}), \
+             patch.object(de._pi, "ThreadPoolExecutor") as mock_pool:
+            mock_pool.return_value.__enter__.return_value.submit.return_value.result.return_value = None
+            result = de._pi.fetch_ohlcv_lseg("0100.HK", "2026-01-01", "2026-06-09")
+        self.assertIsNone(result)
+        # connection succeeded (no exception) — empty result is not a connection failure
+        self.assertFalse(de._pi.lseg_connection_failed())
+        log_text = de._pi._USAGE_LOG.read_text(encoding="utf-8")
+        self.assertIn("LSEG_PRICE | 0100.HK | days_fetched:0 | calls:1", log_text)
+
+    def test_data_logs_days_fetched_count(self):
+        idx = pd.date_range("2026-03-01", periods=10, freq="D")
+        df = pd.DataFrame({
+            "OPEN": [1.0] * 10, "HIGH": [1.0] * 10, "LOW": [1.0] * 10,
+            "CLOSE": [1.0] * 10, "VOLUME": [100] * 10,
+        }, index=idx)
+        with patch.dict(os.environ, {"EDP_API_KEY": "fake"}), \
+             patch.object(de._pi, "ThreadPoolExecutor") as mock_pool:
+            mock_pool.return_value.__enter__.return_value.submit.return_value.result.return_value = df
+            result = de._pi.fetch_ohlcv_lseg("0100.HK", "2026-01-01", "2026-06-09")
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 10)
+        self.assertFalse(de._pi.lseg_connection_failed())
+        log_text = de._pi._USAGE_LOG.read_text(encoding="utf-8")
+        self.assertIn("LSEG_PRICE | 0100.HK | days_fetched:10 | calls:1", log_text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -12,6 +12,6 @@ pandas-ta>=0.4.0
 # Get a free API key at https://finnhub.io
 finnhub-python>=2.4.20
 
-# LSEG Data Library — last-resort fundamentals (requires Eikon/Workspace open)
+# LSEG Data Library — fundamentals + price/OHLCV fallback for HK/A-share tickers
 # Only needed if you have an EDP_API_KEY. Comment out if not using LSEG.
-# lseg-data>=2.0.0
+lseg-data>=2.1.0

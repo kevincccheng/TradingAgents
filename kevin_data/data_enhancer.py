@@ -313,6 +313,8 @@ def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
     try:
         import lseg.data as ld  # noqa: F401
     except ImportError:
+        logging.warning("LSEG fundamentals fallback skipped for %s: lseg-data package not installed", ticker)
+        _pi.mark_lseg_connection_failed()
         return None
 
     def _work():
@@ -327,9 +329,11 @@ def _fetch_lseg(ticker: str, trigger_reason: str) -> Optional[str]:
             df = ex.submit(_work).result(timeout=_LSEG_TIMEOUT)
     except FuturesTimeout:
         logging.warning("LSEG timed out for %s — continuing without", ticker)
+        _pi.mark_lseg_connection_failed()
         return None
     except Exception as exc:
         logging.warning("LSEG fetch failed for %s: %s — continuing", ticker, exc)
+        _pi.mark_lseg_connection_failed()
         return None
 
     _lseg_calls += 1
@@ -447,11 +451,26 @@ def _news_source_label() -> str:
     return "yFinance"
 
 
+def _price_tech_label(ticker: str) -> str:
+    """Render the Price/Technical source label, e.g. 'yFinance', 'AKShare',
+    or 'LSEG+pandas-ta' when either OHLCV or indicators came from LSEG."""
+    price_source = _price_source.get(ticker, "yFinance")
+    if price_source == "none":
+        return "unavailable"
+    indicator_source = _indicator_source.get(ticker, price_source)
+    if "LSEG" in (price_source, indicator_source):
+        return "LSEG+pandas-ta ✓"
+    return f"{price_source} ✓"
+
+
 def _quality_header(ticker: str, fund_source: str, completeness: str, news_source: Optional[str] = None) -> str:
     news = news_source or _news_source_label()
     price_source = _price_source.get(ticker, "yFinance")
     indicator_source = _indicator_source.get(ticker, price_source)
-    price_label = f"{price_source} ✓" if price_source != "none" else "unavailable"
+    price_label = _price_tech_label(ticker)
+    warning = ""
+    if _pi.lseg_connection_failed():
+        warning = "⚠ LSEG connection failed — check EDP_API_KEY or network connectivity\n"
     return (
         "─────────────────────────────────────────\n"
         "DATA SOURCES USED FOR THIS ANALYSIS\n"
@@ -460,7 +479,8 @@ def _quality_header(ticker: str, fund_source: str, completeness: str, news_sourc
         f"News/Sentiment  : {news}\n"
         f"Indicators      : Calculated from {indicator_source}\n"
         f"Data completeness: {completeness}\n"
-        "─────────────────────────────────────────\n\n"
+        "─────────────────────────────────────────\n"
+        f"{warning}\n"
     )
 
 
