@@ -986,9 +986,10 @@ _PRICE_LEVELS_CLOSE_RE = re.compile(
     re.IGNORECASE)
 
 # Priority 3: Technical summary table row "| **Price (Last Close)** | $935.89 | ... |"
-# or "| **Price (Close)** | $891.88 | ... |"
+# or "| **Price (Close)** | $891.88 | ... |" or "| **Close Price** | $1,881.51 | ... |"
 _PRICE_LAST_CLOSE_TBL_RE = re.compile(
-    r'\|\s*\*{0,2}Price\s*\(\s*(?:Last\s+)?Close\s*\)\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|', re.IGNORECASE)
+    r'\|\s*\*{0,2}(?:Price\s*\(\s*(?:Last\s+)?Close\s*\)|(?:Last\s+)?Close\s+Price)\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|',
+    re.IGNORECASE)
 
 # Priority 4: Inline header "Last Close: $935.89" or "**Last Close:** $935.89"
 _PRICE_LAST_CLOSE_HDR_RE = re.compile(
@@ -1811,6 +1812,117 @@ def overall_signal_from_table(table_rows):
 
 # ── Investor Persona Analysis ────────────────────────────────────────────────
 
+# "**Total Debt:** $182M" / "| **Total Debt** | $10.80B |" -- bullet or table cell
+_TOTAL_DEBT_RE = re.compile(
+    r"\*{0,2}Total\s+Debt\*{0,2}\s*[:|]\s*\*{0,2}\s*\$?([\d,.]+)\s*(B|Billion|M|Million)?",
+    re.IGNORECASE)
+# "**Stockholders' Equity:** $13.777 Billion" / "| **Stockholders' Equity** | $72.46B |"
+_STOCKHOLDERS_EQUITY_RE = re.compile(
+    r"\*{0,2}(?:Total\s+)?Stockholders'?\s+Equity\*{0,2}\s*[:|]\s*\*{0,2}\s*\$?([\d,.]+)\s*(B|Billion|M|Million)?",
+    re.IGNORECASE)
+
+# Summary-table row for Gross Margin, e.g. "| **Gross Margin** | 22.5% -> 78.4% in 4 quarters | ... |"
+_GROSS_MARGIN_ROW_RE = re.compile(
+    r'\|\s*\*{0,2}Gross\s+Margin\*{0,2}\s*\|([^|]*)\|', re.IGNORECASE)
+
+
+def _to_millions(value_str, unit):
+    val = float(value_str.replace(',', ''))
+    if unit and unit[0].upper() == 'B':
+        return val * 1000
+    return val
+
+
+def _debt_equity_unit(fund_text, reported):
+    """Determine whether a reported "Debt-to-Equity" figure is actually a
+    ratio (e.g. 0.4x) or a percentage that was mislabeled as a ratio (e.g.
+    SNDK's "1.50x" which Yahoo Finance reports as 1.50%, or MU's "14.9%"
+    which gets its '%' stripped during extraction).
+
+    Cross-checks the reported value against an independently computed
+    Total Debt / Stockholders' Equity ratio from the balance-sheet section,
+    when available. Returns (value, unit) where unit is 'pct' or 'ratio'.
+    """
+    if reported is None:
+        return None, 'ratio'
+
+    computed_pct = None
+    debt_m = _TOTAL_DEBT_RE.search(fund_text)
+    eq_m = _STOCKHOLDERS_EQUITY_RE.search(fund_text)
+    if debt_m and eq_m:
+        debt = _to_millions(debt_m.group(1), debt_m.group(2))
+        equity = _to_millions(eq_m.group(1), eq_m.group(2))
+        if equity > 0:
+            computed_pct = debt / equity * 100
+
+    if reported > 5:
+        print(f'D/E SANITY CHECK FAILED: {reported} -- verify units (ratio vs %)')
+
+    if computed_pct is not None:
+        # If "reported" is much closer to the computed percentage than to
+        # the computed ratio, the report is using percentage units.
+        if abs(reported - computed_pct) < abs(reported - computed_pct / 100):
+            return reported, 'pct'
+        return reported, 'ratio'
+
+    # No balance-sheet figures to cross-check against -- fall back to the
+    # blunt heuristic: ratios above 5x (500% debt-to-equity) are implausible
+    # for almost any company, so treat the number as a percentage instead.
+    return (reported, 'pct') if reported > 5 else (reported, 'ratio')
+
+
+def _extract_gross_margin(fund_text):
+    """Return (current_pct, current_period, prior_pct, prior_period).
+
+    Prefers a per-quarter table with a "Quarter"/"Period" column and a
+    "Gross Margin" column (most recent row = current, oldest row = prior
+    year), since the Summary Table's "22.5% -> 78.4% in 4 quarters" cell
+    format makes the FIRST (oldest) number look like the current value.
+    Falls back to the last percentage in a Summary Table "Gross Margin" row.
+    """
+    for block_m in re.finditer(r'((?:^\|[^\n]*\n)+)', fund_text, re.MULTILINE):
+        lines_ = [l for l in block_m.group(1).strip().split('\n') if l.strip().startswith('|')]
+        rows = parse_tbl(lines_)
+        if len(rows) < 3:
+            continue
+        header = [_strip_md(h).lower() for h in rows[0]]
+        if 'gross margin' not in header:
+            continue
+        period_idx = None
+        for cand in ('quarter', 'period'):
+            if cand in header:
+                period_idx = header.index(cand)
+                break
+        if period_idx is None:
+            continue
+        gm_idx = header.index('gross margin')
+        data_rows = rows[1:]
+        if not data_rows:
+            continue
+
+        def _pct(cell):
+            mm = re.search(r'([\d.]+)\s*%', _strip_md(cell))
+            return float(mm.group(1)) if mm else None
+
+        first, last = data_rows[0], data_rows[-1]
+        cur = _pct(first[gm_idx]) if len(first) > gm_idx else None
+        prior = _pct(last[gm_idx]) if len(last) > gm_idx else None
+        cur_period = _strip_md(first[period_idx]) if len(first) > period_idx else None
+        prior_period = _strip_md(last[period_idx]) if len(last) > period_idx else None
+        if cur is not None:
+            if prior == cur:
+                prior, prior_period = None, None
+            return cur, cur_period, prior, prior_period
+
+    m = _GROSS_MARGIN_ROW_RE.search(fund_text)
+    if m:
+        pcts = re.findall(r'([\d.]+)\s*%', m.group(1))
+        if pcts:
+            return float(pcts[-1]), None, None, None
+
+    return None, None, None, None
+
+
 def extract_financial_metrics(sections):
     """Extract key financial metrics from all report sections for persona analysis."""
     fund = sections.get('fundamentals', '') or ''
@@ -1853,21 +1965,24 @@ def extract_financial_metrics(sections):
         r'ROA\*{0,2}\s*\|\s*([\d.]+)',
         r'ROA[^\d]+([\d.]+)%',
     ])
-    m['gross_margin'] = _fv(fund, [
-        r'\|\s*\*{0,2}Gross\s+Margin\*{0,2}\s*\|\s*([\d.]+)',
-        r'([\d.]+)%\s+gross\s+margin',
-        r'gross\s+margin[s]?[^\d]+([\d.]+)%',
-    ])
+    (m['gross_margin'], m['gross_margin_period'],
+     m['gross_margin_prior'], m['gross_margin_prior_period']) = _extract_gross_margin(fund)
+    if m['gross_margin'] is None:
+        m['gross_margin'] = _fv(fund, [
+            r'([\d.]+)%\s+gross\s+margin',
+            r'gross\s+margin[s]?[^\d]+([\d.]+)%',
+        ])
     m['operating_margin'] = _fv(fund, [
         r'\|\s*\*{0,2}Operating\s+Margin\*{0,2}\s*\|\s*([\d.]+)',
         r'([\d.]+)%\s+operating\s+margin',
         r'operating\s+margin[^\d]+([\d.]+)%',
     ])
-    m['debt_equity'] = _fv(fund, [
+    _de_raw = _fv(fund, [
         r'\|\s*\*{0,2}Debt.to.Equity\*{0,2}\s*\|\s*([\d.]+)',
         r'Debt-to-Equity[^\d]+([\d.]+)',
         r'D/E[^\d]+([\d.]+)',
     ])
+    m['debt_equity'], m['debt_equity_unit'] = _debt_equity_unit(fund, _de_raw)
     m['dividend_yield'] = _fv(fund + market, [
         r'dividend\s+yield[^\d]+([\d.]+)%',
         r'yield\s+~?([\d.]+)%[^:]*dividend',
@@ -1932,7 +2047,11 @@ _PERSONA_SYSTEM_SUFFIX = (
     "SELL and AVOID are valid and expected verdicts. Cheap P/E on peak cyclical earnings is a "
     "classic value trap, not automatically a buy. Do not anchor on the desk verdicts. Unanimous "
     "agreement across philosophically opposed investors on a cyclical stock indicates a "
-    "reasoning failure."
+    "reasoning failure.\n\n"
+    "Use CURRENT period metrics as the primary basis. Prior year figures are context only -- "
+    "do not cite a prior year metric as evidence of current business quality. Forward P/E "
+    "figures may reflect different estimate sources. Weight TTM P/E and normalized earnings "
+    "more heavily than a single forward estimate."
 )
 
 
@@ -1964,16 +2083,44 @@ def _build_persona_context(ticker, metrics, bull_view, bear_view, key_risks_tabl
     can't just parrot the bullish headline numbers."""
     lines = [f'Ticker: {ticker}', '', 'Financial Metrics:']
     labels = {
-        'forward_pe': ('Forward P/E', 'x'), 'ttm_pe': ('TTM P/E', 'x'),
+        'ttm_pe': ('TTM P/E', 'x'),
         'peg': ('PEG Ratio', ''), 'roe': ('ROE', '%'), 'roa': ('ROA', '%'),
-        'gross_margin': ('Gross Margin', '%'), 'operating_margin': ('Operating Margin', '%'),
-        'debt_equity': ('Debt-to-Equity', ''), 'dividend_yield': ('Dividend Yield', '%'),
+        'operating_margin': ('Operating Margin', '%'), 'dividend_yield': ('Dividend Yield', '%'),
         'fcf_quarterly': ('Quarterly FCF ($B)', ''),
     }
     for key, (label, suffix) in labels.items():
         val = metrics.get(key)
         if val is not None:
             lines.append(f'- {label}: {_fmt_metric(val, suffix)}')
+
+    # Forward P/E -- label its provenance since these often come from a
+    # single analyst-estimate source and can diverge sharply from TTM P/E.
+    fpe = metrics.get('forward_pe')
+    if fpe is not None:
+        lines.append(f'- Forward P/E: {fpe:.2f}x (source: analyst estimates -- verify)')
+
+    # Gross margin -- label with the period so personas don't cite a prior
+    # year's margin as evidence about the current business.
+    gm = metrics.get('gross_margin')
+    if gm is not None:
+        period = metrics.get('gross_margin_period')
+        label = f'Current Gross Margin ({period})' if period else 'Gross Margin'
+        lines.append(f'- {label}: {gm:.1f}%')
+        prior = metrics.get('gross_margin_prior')
+        prior_period = metrics.get('gross_margin_prior_period')
+        if prior is not None and prior_period:
+            lines.append(f'- Prior Year Gross Margin ({prior_period}): {prior:.1f}% -- for context only')
+
+    # Debt-to-Equity -- label units explicitly; a reported "1.50" can mean
+    # either a 1.50x ratio (150% leverage) or 1.50% (near debt-free).
+    de = metrics.get('debt_equity')
+    if de is not None:
+        if metrics.get('debt_equity_unit') == 'pct':
+            note = '(near debt-free)' if de < 5 else '(low leverage)' if de < 50 else ''
+            suffix = f' {note}'.rstrip() if note else ''
+            lines.append(f'- Debt-to-Equity: {de:.2f}%{suffix}')
+        else:
+            lines.append(f'- Debt-to-Equity: {de:.2f}x')
 
     if bull_view and bull_view.get('bullets'):
         lines.append('\nBull Case (from the research team):')

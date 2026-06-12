@@ -128,6 +128,9 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Grok 4 - Flagship (dated build)", "grok-4-0709"),
         ],
     },
+    # DeepSeek V4 aliases: deepseek-chat -> v4-flash non-thinking,
+    # deepseek-reasoner -> v4-flash thinking. Both retire 2026-07-24.
+    # Use explicit model IDs (deepseek-v4-pro / deepseek-v4-flash) going forward.
     "deepseek": {
         "quick": [
             ("DeepSeek V4 Flash - Latest V4 fast model", "deepseek-v4-flash"),
