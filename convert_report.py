@@ -6,9 +6,13 @@ Usage:
     python convert_report.py                     # auto-finds best report
     python convert_report.py path/to/report.md   # specific complete_report.md
 """
-import os, sys, re, glob, shutil, subprocess
+import os, sys, re, glob, shutil, subprocess, json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / '.env')
 
 
 # ── Text cleaning ────────────────────────────────────────────────────────────
@@ -917,19 +921,12 @@ def _strip_md(s):
     return re.sub(r'\*+', '', s or '').strip()
 
 
-def _hkt_timestamp(root):
-    """Derive a 'YYYY-MM-DD HH:MM HKT' timestamp from the report folder name
-    (TICKER_YYYYMMDD_HHMMSS). The source timestamp is the local time of the
-    machine generating the report (US Eastern); converted to Hong Kong time
-    (UTC+8) by adding 12 hours (13 during US daylight saving, treated the
-    same here for simplicity)."""
-    name = os.path.basename(os.path.normpath(str(root)))
-    m = re.search(r'(\d{8})_(\d{6})', name)
-    if m:
-        dt = datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
-    else:
-        dt = datetime.now()
-    return (dt + timedelta(hours=12)).strftime('%Y-%m-%d %H:%M HKT')
+def _hkt_timestamp():
+    """Return the current time in Hong Kong as 'YYYY-MM-DD HH:MM HKT'.
+
+    This is the single source of truth for any timestamp shown on the
+    cover page, headers, or footers of generated reports."""
+    return datetime.now(ZoneInfo('Asia/Hong_Kong')).strftime('%Y-%m-%d %H:%M HKT')
 
 
 _MONTH_MAP = {m: i for i, m in enumerate(
@@ -938,8 +935,12 @@ _MONTH_MAP = {m: i for i, m in enumerate(
 
 
 def _parse_long_date(s):
-    """'June 4, 2026' -> '2026-06-04'."""
-    m = re.search(r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', s or '')
+    """'June 4, 2026' -> '2026-06-04'. Already-ISO dates pass through unchanged."""
+    s = (s or '').strip()
+    iso = re.match(r'(\d{4}-\d{2}-\d{2})', s)
+    if iso:
+        return iso.group(1)
+    m = re.search(r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', s)
     if not m:
         return None
     month = _MONTH_MAP.get(m.group(1).capitalize())
@@ -973,15 +974,27 @@ def verdict_hex(verdict):
 
 # ── Latest price / exchange / sector (cover page) ────────────────────────────
 
-# Priority 1: Technical summary table row "| **Price (Last Close)** | $935.89 | ... |"
-_PRICE_LAST_CLOSE_TBL_RE = re.compile(
-    r'\|\s*\*{0,2}Price\s*\(Last\s+Close\)\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|', re.IGNORECASE)
+# Priority 1: "**Close Price on June 10, 2026:** $891.88" -- price + date together
+_PRICE_CLOSE_ON_DATE_RE = re.compile(
+    r'\*{0,2}Close\s+Price\s+on\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})\*{0,2}\s*:?\*{0,2}\s*\$?([\d,]+\.?\d*)',
+    re.IGNORECASE)
 
-# Priority 2: Inline header "Last Close: $935.89" or "**Last Close:** $935.89"
+# Priority 2: "**Key Price Levels on 2026-06-10:**\n- Close: $891.88" -- price + date together
+_PRICE_LEVELS_CLOSE_RE = re.compile(
+    r'\*{0,2}Key\s+Price\s+Levels?\s+on\s+(\d{4}-\d{2}-\d{2}|[A-Za-z]+\s+\d{1,2},?\s*\d{4})\*{0,2}\s*:?\*{0,2}\s*\n'
+    r'(?:[^\n]*\n)*?\s*-\s*Close:?\s*\$?([\d,]+\.?\d*)',
+    re.IGNORECASE)
+
+# Priority 3: Technical summary table row "| **Price (Last Close)** | $935.89 | ... |"
+# or "| **Price (Close)** | $891.88 | ... |"
+_PRICE_LAST_CLOSE_TBL_RE = re.compile(
+    r'\|\s*\*{0,2}Price\s*\(\s*(?:Last\s+)?Close\s*\)\*{0,2}\s*\|\s*\$?([\d,]+\.?\d*)\s*\|', re.IGNORECASE)
+
+# Priority 4: Inline header "Last Close: $935.89" or "**Last Close:** $935.89"
 _PRICE_LAST_CLOSE_HDR_RE = re.compile(
     r'\*{0,2}Last\s+Close[:\s*]+\*{0,2}:?\s*\$?([\d,]+\.?\d*)', re.IGNORECASE)
 
-# Priority 3: "Latest Price" or "Current Price" only as a structured field (table cell
+# Priority 5: "Latest Price" or "Current Price" only as a structured field (table cell
 # or bold label at line start) — never as a phrase mid-prose.
 _PRICE_STRUCTURED_RE = re.compile(
     r'(?:'
@@ -994,6 +1007,7 @@ _PRICE_DATE_PATTERNS = [
     re.compile(r'Last Complete Session:?\*{0,2}\s*\*{0,2}\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
     re.compile(r'as of\s+([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
     re.compile(r'\*\*Date:?\*{0,2}\s*\*{0,2}\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
+    re.compile(r'last\s+trading\s+data:?\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})', re.IGNORECASE),
 ]
 
 # Reasonable price ranges for validation
@@ -1016,30 +1030,47 @@ def _validate_price(price_str, ticker=''):
 def extract_latest_price(market_text, ticker=''):
     """Return (price_str, date_iso) from the market analyst report.
 
-    Priority order:
-    1. Technical Analysis summary table 'Price (Last Close)' row
-    2. Inline 'Last Close: $XXX' header notation
-    3. Structured bold / table-cell 'Current Price' or 'Latest Price' field
+    Priority order (price + date together first, since these are the most
+    unambiguous and come straight from the price_indicators data layer):
+    1. "Close Price on <date>: $XXX" header line
+    2. "Key Price Levels on <date>:" block with a "- Close: $XXX" bullet
+    3. Technical Analysis summary table 'Price (Last Close)' / 'Price (Close)' row
+    4. Inline 'Last Close: $XXX' header notation
+    5. Structured bold / table-cell 'Current Price' or 'Latest Price' field
     If no valid price found, returns (None, None) and the cover page will
-    show 'See Technical Analysis' rather than a wrong number.
+    show 'See Technical Analysis' rather than a wrong number; a warning is
+    printed to the console so the gap is visible during report generation.
     """
     if not market_text:
         return None, None
 
     price = None
+    date = None
 
-    # Priority 1: summary table row
-    m = _PRICE_LAST_CLOSE_TBL_RE.search(market_text)
-    if m and _validate_price(m.group(1), ticker):
-        price = m.group(1)
+    # Priority 1: "Close Price on <date>: $XXX" -- price + date together
+    m = _PRICE_CLOSE_ON_DATE_RE.search(market_text)
+    if m and _validate_price(m.group(2), ticker):
+        price, date = m.group(2), _parse_long_date(m.group(1))
 
-    # Priority 2: inline header
+    # Priority 2: "Key Price Levels on <date>:\n- Close: $XXX" -- price + date together
+    if not price:
+        m = _PRICE_LEVELS_CLOSE_RE.search(market_text)
+        if m and _validate_price(m.group(2), ticker):
+            price, date = m.group(2), _parse_long_date(m.group(1))
+
+    # Priority 3: summary table row
+    if not price:
+        m = _PRICE_LAST_CLOSE_TBL_RE.search(market_text)
+        if m and _validate_price(m.group(1), ticker):
+            price = m.group(1)
+
+    # Priority 4: inline header
     if not price:
         m = _PRICE_LAST_CLOSE_HDR_RE.search(market_text)
         if m and _validate_price(m.group(1), ticker):
             price = m.group(1)
 
-    # Priority 3: structured field (bold label at line start or table cell)
+    # Priority 5: structured field (bold label at line start or table cell)
     if not price:
         m = _PRICE_STRUCTURED_RE.search(market_text)
         if m:
@@ -1047,12 +1078,16 @@ def extract_latest_price(market_text, ticker=''):
             if _validate_price(candidate, ticker):
                 price = candidate
 
-    date = None
-    for pat in _PRICE_DATE_PATTERNS:
-        dm = pat.search(market_text)
-        if dm:
-            date = _parse_long_date(dm.group(1))
-            break
+    if not date:
+        for pat in _PRICE_DATE_PATTERNS:
+            dm = pat.search(market_text)
+            if dm:
+                date = _parse_long_date(dm.group(1))
+                break
+
+    if not price:
+        print(f'WARNING: could not extract latest price for {ticker or "ticker"} '
+              f'from market report -- cover page will show N/A')
     return price, date
 
 
@@ -1347,6 +1382,157 @@ def build_price_target_rows(verdict, pm, trader, current_price, manager_text='')
 
     if len(rows) == 1:
         rows.append(['--', 'N/A', 'No specific price levels provided in source reports'])
+    return rows
+
+
+# ── LLM helpers (Anthropic API; independent of the main agent's provider) ───
+
+_anthropic_client = None
+_anthropic_unavailable = False
+
+
+def _get_anthropic_client():
+    """Return a cached anthropic.Anthropic client, or None if unavailable."""
+    global _anthropic_client, _anthropic_unavailable
+    if _anthropic_client is not None:
+        return _anthropic_client
+    if _anthropic_unavailable:
+        return None
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        _anthropic_unavailable = True
+        return None
+    try:
+        import anthropic
+        _anthropic_client = anthropic.Anthropic(api_key=api_key)
+        return _anthropic_client
+    except Exception:
+        _anthropic_unavailable = True
+        return None
+
+
+def _parse_llm_json(text):
+    """Defensively parse a JSON object from an LLM response: strip ```json
+    fences, then fall back to extracting the first {...} block."""
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+# ── Price targets & action levels (LLM-based extraction) ────────────────────
+
+_PRICE_LEVELS_SYSTEM_PROMPT = """You extract structured price levels from an equity trading plan and research summary.
+
+Read the provided text (a Trader's Plan and Research Manager summary) and extract:
+- current_price: the latest/current price of the stock, if stated
+- entry_tranches: any accumulation zones or staged entry levels (e.g. "accumulate between $700-$750" or "add on weakness below $750")
+- stop_loss: the stop-loss / thesis-invalidation price level
+- targets: any price targets (upside or downside), each with a short label (e.g. "Price Target", "Downside Target", "12-Month Target")
+- horizon: the stated investment time horizon, if any (e.g. "6-12 months"), else null
+
+Return ONLY a JSON object with no other text, matching exactly this schema:
+{
+  "current_price": float|null,
+  "entry_tranches": [{"label": str, "low": float|null, "high": float|null}],
+  "stop_loss": float|null,
+  "targets": [{"label": str, "price": float|null}],
+  "horizon": str|null
+}
+
+Do not invent values. If a field is not mentioned in the text, use null (or an empty list for entry_tranches/targets)."""
+
+
+def extract_price_levels_llm(trader_text, manager_text):
+    """Use claude-haiku-4-5-20251001 to extract structured price levels from
+    the Trader's Plan + Research Manager text. Returns a dict matching the
+    schema in _PRICE_LEVELS_SYSTEM_PROMPT, or None on any failure."""
+    client = _get_anthropic_client()
+    if client is None:
+        return None
+    combined = '\n\n'.join(t for t in (trader_text, manager_text) if t and t.strip())
+    if not combined.strip():
+        return None
+    try:
+        resp = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=600,
+            system=_PRICE_LEVELS_SYSTEM_PROMPT,
+            messages=[{'role': 'user', 'content': combined}],
+        )
+        return _parse_llm_json(resp.content[0].text)
+    except Exception as e:
+        print(f'WARNING: price-level LLM extraction failed: {e}')
+        return None
+
+
+def _fmt_price(v):
+    """float -> '$1,234.56', or None if v is not a usable number."""
+    if v is None:
+        return None
+    try:
+        return f'${float(v):,.2f}'
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_price_range(low, high):
+    lo, hi = _fmt_price(low), _fmt_price(high)
+    if lo and hi:
+        return f'{lo} - {hi}'
+    return lo or hi
+
+
+def build_price_target_rows_llm(levels):
+    """Build 'Price Targets & Action Levels' rows from LLM-extracted price
+    levels. Returns None if levels is empty/unusable so callers can fall
+    back to the regex-based build_price_target_rows."""
+    if not levels:
+        return None
+
+    rows = [['Level', 'Price', 'Notes']]
+
+    cur = _fmt_price(levels.get('current_price'))
+    if cur:
+        rows.append(['Current Price', cur, 'Latest close'])
+
+    tranches = levels.get('entry_tranches') or []
+    multi = len(tranches) > 1
+    for i, tranche in enumerate(tranches, start=1):
+        price = _fmt_price_range(tranche.get('low'), tranche.get('high'))
+        if not price:
+            continue
+        label = tranche.get('label') or (f'Entry Tranche {i}' if multi else 'Entry Zone')
+        rows.append([label, price, 'Trader-recommended accumulation level'])
+
+    stop = _fmt_price(levels.get('stop_loss'))
+    if stop:
+        rows.append(['Stop Loss', stop, 'Thesis-invalidation level'])
+
+    for target in levels.get('targets') or []:
+        price = _fmt_price(target.get('price'))
+        if not price:
+            continue
+        label = target.get('label') or 'Price Target'
+        rows.append([label, price, 'Portfolio Manager / trader target'])
+
+    if levels.get('horizon'):
+        rows.append(['Horizon', '--', levels['horizon']])
+
+    if len(rows) == 1:
+        return None
     return rows
 
 
@@ -1707,18 +1893,21 @@ def _fmt_metric(v, suffix=''):
     return f'{v:.2f}'
 
 
-def select_personas(ticker, metrics):
-    """Return 5 persona filename stems based on ticker type and key metrics."""
-    if re.search(r'\.(HK|SS|SZ)$', ticker, re.IGNORECASE):
-        return ['warren_buffett', 'charlie_munger', 'michael_burry',
-                'aswath_damodaran', 'stanley_druckenmiller']
-    pe = metrics.get('forward_pe') or metrics.get('ttm_pe')
-    div = metrics.get('dividend_yield') or 0
-    if pe and pe < 15 and div > 2.0:
-        return ['warren_buffett', 'charlie_munger', 'ben_graham',
-                'mohnish_pabrai', 'peter_lynch']
-    return ['warren_buffett', 'charlie_munger', 'cathie_wood',
-            'stanley_druckenmiller', 'peter_lynch']
+# Grouping for the Investor Persona Analysis panel -- all 13 personas render,
+# organized by investment philosophy so related viewpoints sit together.
+_PERSONA_GROUPS = {
+    'Value Investors': ['warren_buffett', 'charlie_munger', 'ben_graham',
+                         'mohnish_pabrai', 'aswath_damodaran'],
+    'Growth Investors': ['cathie_wood', 'peter_lynch', 'phil_fisher',
+                          'rakesh_jhunjhunwala'],
+    'Macro & Trading': ['stanley_druckenmiller', 'michael_burry', 'nassim_taleb'],
+    'Other': ['bill_ackman'],
+}
+
+
+def select_personas():
+    """Return all 13 persona filename stems, grouped by investment philosophy."""
+    return _PERSONA_GROUPS
 
 
 _PERSONA_DISPLAY_NAMES = {
@@ -1738,237 +1927,118 @@ _PERSONA_DISPLAY_NAMES = {
 }
 
 
-def _persona_analysis(persona_name, metrics, ticker):
-    """Return (verdict, focus_metric_str, rationale_str) for one persona.
+_PERSONA_SYSTEM_SUFFIX = (
+    "\n\nApply this investor's documented philosophy STRICTLY, including their known aversions. "
+    "SELL and AVOID are valid and expected verdicts. Cheap P/E on peak cyclical earnings is a "
+    "classic value trap, not automatically a buy. Do not anchor on the desk verdicts. Unanimous "
+    "agreement across philosophically opposed investors on a cyclical stock indicates a "
+    "reasoning failure."
+)
 
-    Verdict is determined by rule-based logic applying each investor's
-    documented thresholds to the extracted financial metrics.
-    """
-    fpe = metrics.get('forward_pe')
-    ttp = metrics.get('ttm_pe')
-    peg = metrics.get('peg')
-    roe = metrics.get('roe')
-    gm  = metrics.get('gross_margin')
-    om  = metrics.get('operating_margin')
-    de  = metrics.get('debt_equity')
-    fcf = metrics.get('fcf_quarterly')
 
-    def _f(v, sfx=''): return _fmt_metric(v, sfx)
+def _load_persona_system_prompt(persona_name, persona_dir):
+    """Load a persona's '## System Prompt' code block plus its
+    '## Hard Rules / Known Aversions' section, with the anti-sycophancy
+    suffix appended. Returns None if the file or system prompt is missing."""
+    path = persona_dir / f'{persona_name}.md'
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return None
 
-    if persona_name == 'warren_buffett':
-        focus = f"ROE {_f(roe,'%')} | Fwd P/E {_f(fpe,'x')}"
-        s1 = (f"Buffett would focus on {ticker}'s ROE of {_f(roe,'%')} and forward P/E of "
-              f"{_f(fpe,'x')}, applying his owner-earnings framework to judge whether the "
-              f"price offers a margin of safety relative to intrinsic value.")
-        if roe and roe > 15 and fpe and fpe < 20:
-            verdict = 'BUY'
-            s2 = (f"At {_f(fpe,'x')} forward P/E with {_f(roe,'%')} ROE and gross margins of "
-                  f"{_f(gm,'%')}, the business delivers high returns on capital with a "
-                  f"durable competitive position in AI-driven memory demand.")
-            s3 = ("A sustained decline in HBM pricing power, loss of key hyperscaler supply "
-                  "relationships, or evidence of structurally declining margins would trigger reassessment.")
-        elif roe and roe > 15:
-            verdict = 'HOLD'
-            s2 = (f"The {_f(roe,'%')} ROE confirms business quality, but the TTM P/E of "
-                  f"{_f(ttp,'x')} raises margin-of-safety concerns given memory's cyclicality "
-                  "and peak-earnings risk at the current stage of the AI capex cycle.")
-            s3 = ("A price decline providing a margin of safety above 20% relative to "
-                  "a conservative owner-earnings estimate, or evidence of durable multi-cycle "
-                  "margins, would support a stronger conviction.")
-        else:
-            verdict = 'HOLD'
-            s2 = ("Insufficient ROE history to confirm a durable moat across a full memory "
-                  "cycle; Buffett would note that semiconductor memory is inherently cyclical "
-                  "and demands a higher margin of safety than the current price provides.")
-            s3 = ("Five or more years of consistently high ROE through a complete business "
-                  "cycle would be needed to reach Buffett's bar for a permanent holding.")
+    sp_m = re.search(r'## System Prompt\s*\n```\s*\n(.*?)\n```', text, re.DOTALL)
+    if not sp_m:
+        return None
+    system_prompt = sp_m.group(1).strip()
 
-    elif persona_name == 'charlie_munger':
-        focus = f"OpMargin {_f(om,'%')} | ROE {_f(roe,'%')}"
-        s1 = (f"Munger would evaluate {ticker}'s business quality through its operating "
-              f"margin of {_f(om,'%')} and ROE of {_f(roe,'%')}, assessing whether these "
-              f"represent a genuinely excellent business available at a fair price.")
-        if roe and roe > 20 and om and om > 20 and fpe and fpe < 30:
-            verdict = 'BUY'
-            s2 = (f"Operating margins of {_f(om,'%')} and ROE of {_f(roe,'%')} at a forward "
-                  f"P/E of {_f(fpe,'x')} represent the rare combination of business excellence "
-                  "and reasonable valuation that Munger demands before committing capital.")
-            s3 = ("Evidence of margin erosion from competitive HBM qualification by Samsung "
-                  "or SK Hynix, or management pivoting to value-destructive acquisitions, "
-                  "would reverse the investment case.")
-        elif roe and roe > 15:
-            verdict = 'HOLD'
-            s2 = ("The business quality is visible in the margin and return metrics, but "
-                  "Munger would require confirmation that AI-driven margins are a structural "
-                  "advantage rather than a temporary demand peak before building a large position.")
-            s3 = ("Multiple quarters of sustained 60%+ operating margins through a macro "
-                  "downturn, combined with disciplined capital allocation, would satisfy his "
-                  "bar for business quality at the current price.")
-        else:
-            verdict = 'HOLD'
-            s2 = ("Adequate returns but insufficient evidence of the business quality and "
-                  "management caliber Munger demands before deploying significant capital.")
-            s3 = ("Demonstrating consistent capital allocation discipline — buybacks at "
-                  "sensible valuations and avoidance of empire-building — would improve the view.")
+    hr_m = re.search(r'## Hard Rules / Known Aversions\s*\n(.*?)(?=\n## |\Z)', text, re.DOTALL)
+    if hr_m:
+        system_prompt += '\n\n## Hard Rules / Known Aversions\n' + hr_m.group(1).strip()
 
-    elif persona_name == 'cathie_wood':
-        focus = f"Gross Margin {_f(gm,'%')} | Disruption + ROE {_f(roe,'%')}"
-        s1 = (f"Wood would evaluate {ticker}'s disruption potential in AI infrastructure, "
-              f"focusing on revenue acceleration, gross margin of {_f(gm,'%')}, and HBM3E "
-              "memory as a critical enabler of the next generation of AI compute.")
-        if gm and gm > 50 and roe and roe > 15:
-            verdict = 'BUY'
-            s2 = (f"With {_f(gm,'%')} gross margins expanding from a loss-making position and "
-                  "HBM3E supply locked into NVIDIA and AMD GPU platforms, the disruption "
-                  "thesis is structurally intact and accelerating with AI infrastructure capex.")
-            s3 = ("Deceleration in hyperscaler AI capex commitments, Samsung's successful "
-                  "HBM3E qualification at scale, or architectural shifts away from HBM-style "
-                  "memory would challenge the disruption narrative and trigger a review.")
-        else:
-            verdict = 'HOLD'
-            s2 = ("The company is a critical AI supply chain node, but the disruption thesis "
-                  "requires sustained gross margin expansion and continued R&D leadership to "
-                  "justify a premium growth multiple above current levels.")
-            s3 = ("Acceleration of HBM adoption rates or new AI architectures requiring "
-                  "exponentially more memory bandwidth would strengthen the bull thesis materially.")
+    return system_prompt + _PERSONA_SYSTEM_SUFFIX
 
-    elif persona_name == 'stanley_druckenmiller':
-        focus = f"Fwd P/E {_f(fpe,'x')} | Momentum + Macro tailwind"
-        s1 = (f"Druckenmiller would assess {ticker}'s asymmetric risk-reward, weighing the "
-              f"200%+ YTD momentum against the recent MACD bearish crossover and institutional "
-              "distribution on the two highest-volume days of the year.")
-        if fpe and fpe < 15 and roe and roe > 15:
-            verdict = 'BUY'
-            s2 = (f"Forward P/E of {_f(fpe,'x')} with {_f(roe,'%')} ROE and confirmed macro "
-                  "tailwind from hyperscaler AI capex creates the asymmetric setup he requires "
-                  "— limited downside at current levels with substantial structural upside.")
-            s3 = ("A break below key technical support combined with decelerating hyperscaler "
-                  "capex guidance would force an immediate exit, as momentum and macro tailwind "
-                  "are his primary conditions for holding.")
-        else:
-            verdict = 'HOLD'
-            s2 = (f"Near-term technical deterioration — MACD bearish crossover and two "
-                  f"distribution days on 70M+ volume — shifts risk-reward from asymmetric "
-                  f"to balanced at current levels despite the compelling forward P/E of {_f(fpe,'x')}.")
-            s3 = ("Reclaiming the 10-day EMA on declining volume with confirmed macro catalyst "
-                  "from strong hyperscaler capex guidance in July would restore the asymmetric "
-                  "setup required to add conviction.")
 
-    elif persona_name == 'peter_lynch':
-        focus = f"PEG {_f(peg,'')} | Fwd P/E {_f(fpe,'x')}"
-        s1 = (f"Lynch would apply his PEG framework to {ticker}, noting a PEG of {_f(peg)} "
-              f"against forward P/E of {_f(fpe,'x')} — well below his 1.5 threshold for a "
-              "compelling GARP buy with potential ten-bagger characteristics.")
-        if peg and peg < 1.5:
-            verdict = 'BUY'
-            s2 = (f"A PEG of {_f(peg)} signals the stock is significantly undervalued relative "
-                  f"to its earnings growth rate; with {_f(gm,'%')} gross margins and an "
-                  "understandable AI memory business model, this has the hallmarks of a "
-                  "long-term multi-bagger at current prices.")
-            s3 = ("If the PEG rises above 1.5 due to multiple expansion without corresponding "
-                  "EPS growth acceleration, or if the AI demand story shows signs of peaking, "
-                  "Lynch would reduce the position significantly.")
-        elif peg and peg < 2.0:
-            verdict = 'HOLD'
-            s2 = (f"PEG of {_f(peg)} indicates fair-to-reasonable value, but Lynch would "
-                  "want to see continued earnings acceleration before adding to the position, "
-                  "given memory's inherent cyclicality.")
-            s3 = ("A reduction in PEG below 1.0 driven by EPS estimate upgrades, or "
-                  "continued operating margin expansion confirming the AI memory super-cycle, "
-                  "would trigger a full conviction position.")
-        else:
-            verdict = 'SELL'
-            s2 = ("PEG above 2.0 means the market is pricing in growth the stock may not "
-                  "deliver over a full business cycle; Lynch would reduce exposure and "
-                  "wait for a better entry point.")
-            s3 = ("Return of the PEG below 1.5 through price correction or upward EPS "
-                  "revisions would restore the stock to Lynch's buy list.")
+def _build_persona_context(ticker, metrics, bull_view, bear_view, key_risks_table, composite):
+    """Build the shared user-message context fed to every persona LLM call:
+    headline metrics, bull case, bear case, and key risks -- so personas
+    can't just parrot the bullish headline numbers."""
+    lines = [f'Ticker: {ticker}', '', 'Financial Metrics:']
+    labels = {
+        'forward_pe': ('Forward P/E', 'x'), 'ttm_pe': ('TTM P/E', 'x'),
+        'peg': ('PEG Ratio', ''), 'roe': ('ROE', '%'), 'roa': ('ROA', '%'),
+        'gross_margin': ('Gross Margin', '%'), 'operating_margin': ('Operating Margin', '%'),
+        'debt_equity': ('Debt-to-Equity', ''), 'dividend_yield': ('Dividend Yield', '%'),
+        'fcf_quarterly': ('Quarterly FCF ($B)', ''),
+    }
+    for key, (label, suffix) in labels.items():
+        val = metrics.get(key)
+        if val is not None:
+            lines.append(f'- {label}: {_fmt_metric(val, suffix)}')
 
-    elif persona_name == 'michael_burry':
-        focus = f"Fwd P/E {_f(fpe,'x')} | FCF yield vs market cap"
-        fcf_note = f"quarterly FCF of ${fcf:.1f}B" if fcf else "positive FCF"
-        s1 = (f"Burry would screen {ticker}'s FCF yield and balance sheet stress, noting "
-              f"that despite {fcf_note}, the forward P/E of {_f(fpe,'x')} and P/B of "
-              f"~14.6x suggest a growth premium leaving limited margin of safety by his "
-              "deep-value standards.")
-        verdict = 'HOLD'
-        s2 = (f"At forward P/E {_f(fpe,'x')}, earnings are cheap on a forward basis but "
-              "the stock trades at a premium to tangible book; Burry's FCF-yield-first "
-              "approach requires yield above 8% on normalized (mid-cycle) earnings before "
-              "he would consider a semiconductor at peak-cycle margins.")
-        s3 = ("A price correction raising normalized FCF yield above 8%, combined with "
-              "insider buying activity, would meet his deep-value threshold for entry.")
+    if bull_view and bull_view.get('bullets'):
+        lines.append('\nBull Case (from the research team):')
+        lines.extend(f'- {b}' for b in bull_view['bullets'])
 
-    elif persona_name == 'ben_graham':
-        focus = f"TTM P/E {_f(ttp,'x')} | Graham Number vs market price"
-        s1 = (f"Graham would compute the Graham Number (sqrt(22.5 x EPS x BVPS)) for "
-              f"{ticker} and compare it to the current market price to calculate margin of safety, "
-              f"noting TTM P/E of {_f(ttp,'x')} and P/B ratio of approximately 14.6x.")
-        verdict = 'SELL'
-        s2 = (f"With TTM P/E of {_f(ttp,'x')} and the current price representing a "
-              "substantial premium to book value (~14.6x P/B), the Graham Number is well "
-              "below the market price, leaving a negative margin of safety by Graham's "
-              "strict quantitative standards.")
-        s3 = ("A price decline to within 30% of the Graham Number, combined with at least "
-              "two years of stable earnings at the current normalized level, would be "
-              "required before Graham considers a position.")
+    if bear_view and bear_view.get('bullets'):
+        lines.append('\nBear Case / Key Risks (from the research team):')
+        lines.extend(f'- {b}' for b in bear_view['bullets'])
 
-    elif persona_name == 'aswath_damodaran':
-        focus = f"Fwd P/E {_f(fpe,'x')} | DCF intrinsic value (beta ~2.17)"
-        s1 = (f"Damodaran would build a DCF model for {ticker}, using WACC derived from "
-              f"the stock's beta of approximately 2.17 and current risk-free rates, projecting "
-              f"free cash flows with explicit assumptions about margin mean-reversion.")
-        if fpe and fpe < 15 and roe and roe > 20:
-            verdict = 'BUY'
-            s2 = (f"At forward P/E of {_f(fpe,'x')} with {_f(roe,'%')} ROE, a conservative "
-                  "DCF incorporating peak-to-normal margin reversion likely places intrinsic "
-                  "value above the current market price by more than 20%, providing the "
-                  "required margin of safety.")
-            s3 = ("If forward EPS estimates are revised down by more than 20% due to AI "
-                  "capex slowdown or competitive margin compression, intrinsic value would "
-                  "converge toward current prices, eliminating the margin of safety.")
-        else:
-            verdict = 'HOLD'
-            s2 = ("The DCF value depends critically on whether current 67% operating margins "
-                  "are structural or cyclical; a base-case assuming mean-reversion to 25-30% "
-                  "margins within 3-4 years would place intrinsic value close to market price.")
-            s3 = ("Sustained evidence of structural rather than cyclical margin improvement — "
-                  "demonstrated through two full market cycles — would allow a confident "
-                  "DCF-based BUY call at current multiples.")
+    if key_risks_table and len(key_risks_table) > 1:
+        lines.append('\nKey Risks (from fundamentals analysis):')
+        for row in key_risks_table[1:]:
+            factor, severity, evidence = (row + ['', '', ''])[:3]
+            lines.append(f'- {factor} (Severity: {severity}): {evidence}')
 
-    elif persona_name == 'mohnish_pabrai':
-        focus = f"PEG {_f(peg,'')} | FCF + downside protection"
-        s1 = (f"Pabrai would run his 'heads I win, tails I don't lose much' checklist on "
-              f"{ticker}, evaluating FCF stability and downside protection before considering "
-              f"the PEG of {_f(peg)} as evidence of the path to doubling capital.")
-        if de and de < 1.0 and roe and roe > 20 and peg and peg < 1.0:
-            verdict = 'BUY'
-            s2 = (f"Actual debt-to-equity of ~15% (adjusted from the reported {_f(de)}), "
-                  f"{_f(roe,'%')} ROE, and $13.9B cash provide the downside protection Pabrai "
-                  f"demands, while PEG of {_f(peg)} confirms the path to doubling at current valuations.")
-            s3 = ("A meaningful increase in debt to fund capacity expansion, or management "
-                  "deploying capital into value-destructive acquisitions, would break the "
-                  "downside-protection pillar of the thesis.")
-        else:
-            verdict = 'HOLD'
-            s2 = (f"The upside case is compelling with PEG of {_f(peg)} and strong FCF, "
-                  "but the reported debt-to-equity figure introduces uncertainty about "
-                  "downside protection that Pabrai's framework — which puts capital "
-                  "preservation ahead of return — requires to be resolved first.")
-            s3 = ("Confirmation that adjusted net debt is below 30% of equity, combined "
-                  "with a clear path to FCF yield above 7% on current market cap, would "
-                  "resolve the key uncertainty and likely trigger investment.")
+    if composite:
+        lines.append(f'\nDesk Composite Verdict (context only -- do not anchor on this): {composite}')
 
-    else:
-        focus = 'See rationale'
-        verdict = 'HOLD'
-        s1 = f"This investor would evaluate {ticker}'s fundamentals against their core framework."
-        s2 = "Key metrics available: " + ', '.join(
-            f"{k}={_f(v)}" for k, v in metrics.items() if v is not None)
-        s3 = "A deeper framework-specific analysis is required for a high-conviction verdict."
+    return '\n'.join(lines)
 
-    rationale = f"{s1} {s2} {s3}"
-    return verdict, focus, rationale
+
+_PERSONA_VERDICT_JSON_INSTRUCTIONS = (
+    '\n\nRespond with ONLY a JSON object, no other text, in this exact schema:\n'
+    '{"verdict": "BUY|HOLD|SELL|AVOID", '
+    '"focus_metric": "<short string, e.g. \'ROE 18% | Fwd P/E 8x\'>", '
+    '"rationale": "<2-4 sentence rationale in your voice, citing specific numbers>"}'
+)
+
+
+def _persona_analysis_llm(persona_name, system_prompt, context_text, ticker):
+    """Call claude-sonnet-4-6 with a persona's system prompt + the shared
+    context. Returns (verdict, focus, rationale) or None on any failure."""
+    client = _get_anthropic_client()
+    if client is None or not system_prompt:
+        return None
+    try:
+        resp = client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=700,
+            system=system_prompt,
+            messages=[{'role': 'user', 'content': context_text + _PERSONA_VERDICT_JSON_INSTRUCTIONS}],
+        )
+        data = _parse_llm_json(resp.content[0].text)
+        if not data:
+            return None
+        verdict = str(data.get('verdict', '')).upper().strip()
+        if verdict not in ('BUY', 'HOLD', 'SELL', 'AVOID'):
+            return None
+        rationale = str(data.get('rationale', '')).strip()
+        if not rationale:
+            return None
+        focus = str(data.get('focus_metric', '')).strip() or 'See rationale'
+        return verdict, focus, rationale
+    except Exception as e:
+        print(f'WARNING: persona LLM call failed for {persona_name} ({ticker}): {e}')
+        return None
+
+
+def _persona_fallback(persona_name, ticker):
+    """Used when the LLM call is unavailable or fails -- a neutral
+    placeholder rather than a fabricated rule-based verdict."""
+    display = _PERSONA_DISPLAY_NAMES.get(persona_name, persona_name.replace('_', ' ').title())
+    return ('HOLD', 'N/A',
+            f"{display}'s analysis could not be generated (LLM call unavailable or failed). "
+            f"See the Fundamental and Technical Analysis sections for {ticker}'s underlying metrics.")
 
 
 # ── Shared rendering helpers (used by both PDF builders) ─────────────────────
@@ -2023,7 +2093,7 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     MGRAY = colors.HexColor('#CED4DA')
     DGRAY = colors.HexColor('#343A40')
 
-    footer_ts = _hkt_timestamp(root)
+    footer_ts = _hkt_timestamp()
 
     def draw_footer(canvas, doc):
         canvas.saveState()
@@ -2062,7 +2132,13 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         if not rows:
             return []
         ncols = max(len(r) for r in rows)
-        cw = col_widths or [(7.0*inch)/ncols]*ncols
+        # Fall back to an even split summing to the usable frame width
+        # (7.0in for letter with 0.75in margins) if col_widths doesn't
+        # match the actual column count -- avoids overflow/misalignment.
+        if col_widths and len(col_widths) == ncols:
+            cw = col_widths
+        else:
+            cw = [(7.0*inch)/ncols]*ncols
         data = [[Paragraph(md2rl(c), tbl_h) for c in rows[0]]]
         for row in rows[1:]:
             pad = (row + ['']*ncols)[:ncols]
@@ -2169,8 +2245,11 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
     rm_desk = extract_rm_desk(sections['manager'])
     trader_desk = extract_trader_desk(sections['trader'])
     composite, agree_desks, disagree_desks = compute_composite(pm_desk, rm_desk, trader_desk)
-    price_target_rows = build_price_target_rows(
-        composite, pm_desk, trader_desk, latest_price, sections['manager'])
+    price_levels = extract_price_levels_llm(sections.get('trader', ''), sections.get('manager', ''))
+    price_target_rows = build_price_target_rows_llm(price_levels)
+    if not price_target_rows:
+        price_target_rows = build_price_target_rows(
+            composite, pm_desk, trader_desk, latest_price, sections['manager'])
     rationale_bullets = composite_rationale_bullets(
         pm_desk, rm_desk, trader_desk, composite, agree_desks, disagree_desks,
         decision_text=sections['decision'], manager_text=sections['manager'])
@@ -2195,10 +2274,14 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         Paragraph(f'Analysis Date: {date}  |  Report Generated: {footer_ts}',
                   ps('d_cd', fontSize=13, textColor=GRAY, leading=17, alignment=TA_CENTER)),
     ]
-    if latest_price:
+    if latest_price and price_date:
+        try:
+            d = datetime.strptime(price_date, '%Y-%m-%d')
+            price_line = f'Last Close ({d.strftime("%b")} {d.day}): ${latest_price}'
+        except ValueError:
+            price_line = f'Last Close: ${latest_price} (as of {price_date})'
+    elif latest_price:
         price_line = f'Latest Price: ${latest_price}'
-        if price_date:
-            price_line += f' (as of {price_date})'
     else:
         price_line = 'Latest Price: N/A -- see Technical Analysis section'
     story.append(Paragraph(esc(price_line),
@@ -2366,7 +2449,7 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         if news.get('actionable'):
             story.append(Paragraph('Actionable Insights', h3s))
             story += rl_table(news['actionable'],
-                              col_widths=[1.75*inch, 3.5*inch, 1.75*inch])
+                              col_widths=[2.1*inch, 1.0*inch, 0.85*inch, 3.05*inch])
         if news['table']:
             story.append(Paragraph('Key Data Points', h3s))
             story += rl_table(news['table'],
@@ -2430,7 +2513,9 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
             ps('d_psubtitle', fontSize=10, textColor=GRAY, leading=13, spaceAfter=10)))
 
         fin_metrics = extract_financial_metrics(sections)
-        persona_names = select_personas(ticker, fin_metrics)
+        persona_groups = select_personas()
+        persona_context = _build_persona_context(
+            ticker, fin_metrics, bull_view, bear_view, key_risks_table, composite)
 
         DARK_NAVY = colors.HexColor('#2C3E50')
         BUY_BG    = colors.HexColor('#1B7E45')
@@ -2438,7 +2523,11 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         SELL_BG   = colors.HexColor('#B22222')
 
         def _verd_bg(v):
-            return BUY_BG if v == 'BUY' else (SELL_BG if v == 'SELL' else HOLD_BG)
+            if v == 'BUY':
+                return BUY_BG
+            if v in ('SELL', 'AVOID'):
+                return SELL_BG
+            return HOLD_BG
 
         AVAIL_W = 7.0 * inch
         pcol = [AVAIL_W*0.18, AVAIL_W*0.12, AVAIL_W*0.22, AVAIL_W*0.48]
@@ -2453,43 +2542,65 @@ def build_distilled_pdf(root: Path, ticker: str, date: str, sections: dict, base
         hdr_row = [Paragraph(h, p_hdr_st)
                    for h in ('Investor', 'Verdict', 'Focus Metric', 'Rationale')]
 
-        tdata  = [hdr_row]
-        tstyle = [
-            ('BACKGROUND',    (0,0),(-1,0),  DARK_NAVY),
-            ('GRID',          (0,0),(-1,-1), 0.5, colors.HexColor('#CCCCCC')),
-            ('TOPPADDING',    (0,0),(-1,-1), 6),
-            ('BOTTOMPADDING', (0,0),(-1,-1), 6),
-            ('LEFTPADDING',   (0,0),(-1,-1), 8),
-            ('RIGHTPADDING',  (0,0),(-1,-1), 8),
-            ('VALIGN',        (0,0),(-1,-1), 'TOP'),
-        ]
+        all_verdicts = []
 
-        for ri, pname in enumerate(persona_names, start=1):
-            verdict, focus, rationale = _persona_analysis(pname, fin_metrics, ticker)
-            bg = _verd_bg(verdict)
-            display = _PERSONA_DISPLAY_NAMES.get(pname, pname.replace('_', ' ').title())
-            row_bg  = colors.white if ri % 2 == 1 else colors.HexColor('#F8F8F8')
+        for group_name, pnames in persona_groups.items():
+            story.append(Paragraph(group_name, h2s))
 
-            v_st = ps(f'd_pv{ri}', fontSize=9, fontName='Helvetica-Bold',
-                      leading=11, alignment=TA_CENTER, textColor=colors.white)
-            tdata.append([
-                Paragraph(clean(display), p_lbl_st),
-                Paragraph(verdict, v_st),
-                Paragraph(clean(focus), p_body_st),
-                Paragraph(md2rl(clean(rationale)), p_body_st),
-            ])
-            tstyle.append(('BACKGROUND', (1, ri), (1, ri), bg))
-            tstyle.append(('BACKGROUND', (0, ri), (0, ri), row_bg))
-            tstyle.append(('BACKGROUND', (2, ri), (3, ri), row_bg))
+            tdata  = [hdr_row]
+            tstyle = [
+                ('BACKGROUND',    (0,0),(-1,0),  DARK_NAVY),
+                ('GRID',          (0,0),(-1,-1), 0.5, colors.HexColor('#CCCCCC')),
+                ('TOPPADDING',    (0,0),(-1,-1), 6),
+                ('BOTTOMPADDING', (0,0),(-1,-1), 6),
+                ('LEFTPADDING',   (0,0),(-1,-1), 8),
+                ('RIGHTPADDING',  (0,0),(-1,-1), 8),
+                ('VALIGN',        (0,0),(-1,-1), 'TOP'),
+            ]
 
-        persona_tbl = Table(tdata, colWidths=pcol, repeatRows=1)
-        persona_tbl.setStyle(TableStyle(tstyle))
-        story += [Spacer(1, 6), persona_tbl, Spacer(1, 10)]
+            for ri, pname in enumerate(pnames, start=1):
+                system_prompt = _load_persona_system_prompt(pname, persona_dir)
+                result = _persona_analysis_llm(pname, system_prompt, persona_context, ticker)
+                if result is None:
+                    result = _persona_fallback(pname, ticker)
+                verdict, focus, rationale = result
+                all_verdicts.append(verdict)
+
+                bg = _verd_bg(verdict)
+                display = _PERSONA_DISPLAY_NAMES.get(pname, pname.replace('_', ' ').title())
+                row_bg  = colors.white if ri % 2 == 1 else colors.HexColor('#F8F8F8')
+
+                v_st = ps(f'd_pv_{group_name}_{ri}', fontSize=9, fontName='Helvetica-Bold',
+                          leading=11, alignment=TA_CENTER, textColor=colors.white)
+                tdata.append([
+                    Paragraph(clean(display), p_lbl_st),
+                    Paragraph(verdict, v_st),
+                    Paragraph(clean(focus), p_body_st),
+                    Paragraph(md2rl(clean(rationale)), p_body_st),
+                ])
+                tstyle.append(('BACKGROUND', (1, ri), (1, ri), bg))
+                tstyle.append(('BACKGROUND', (0, ri), (0, ri), row_bg))
+                tstyle.append(('BACKGROUND', (2, ri), (3, ri), row_bg))
+
+            persona_tbl = Table(tdata, colWidths=pcol, repeatRows=1)
+            persona_tbl.setStyle(TableStyle(tstyle))
+            story += [Spacer(1, 6), persona_tbl, Spacer(1, 10)]
+
         story.append(Paragraph(
-            "Note: Persona verdicts apply each investor's documented criteria to available "
-            "report data. Rationales are illustrative applications of their published "
-            "frameworks, not predictive statements.",
+            "Note: Persona verdicts apply each investor's documented philosophy and known "
+            "aversions to the bull case, bear case, and key risks for this report. "
+            "Rationales are illustrative applications of their published frameworks, "
+            "not predictive statements.",
             ps('d_pdiscl', fontSize=7, textColor=GRAY, leading=9)))
+
+        if all_verdicts:
+            counts = {}
+            for v in all_verdicts:
+                counts[v] = counts.get(v, 0) + 1
+            top_verdict, top_count = max(counts.items(), key=lambda kv: kv[1])
+            if top_count >= 10:
+                print(f'PERSONA HOMOGENEITY WARNING: {top_count}/{len(all_verdicts)} '
+                      f'personas returned {top_verdict} for {ticker}')
 
     doc = SimpleDocTemplate(
         str(pdf_path), pagesize=letter,
